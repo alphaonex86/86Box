@@ -340,6 +340,7 @@ umc_8886_reset(void *priv)
         dev->pci_conf_sb[1][0x01] = 0x10;
         dev->pci_conf_sb[1][0x02] = (dev->ide_id & 0xff); /* 8886xx IDE */
         dev->pci_conf_sb[1][0x03] = ((dev->ide_id >> 8) & 0xff);
+        dev->pci_conf_sb[0][0x0e] = 0x80; /* Multi-function: IDE is function 1 */
         dev->pci_conf_sb[1][0x04] = 0x05; /* Start with Internal IDE Enabled */
         dev->pci_conf_sb[1][0x08] = 0x10;
         dev->pci_conf_sb[1][0x09] = 0x8f;

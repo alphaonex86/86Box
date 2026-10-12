@@ -196,6 +196,7 @@ int reg_op_waitstates; /* Extra cycles added to pure register/branch instruction
                            this is compensated too. Set by inboard386.c the same way as
                            io_waitstates. */
 int cpu_cache_int_enabled;
+void (*cpu_cache_hook)(int event);
 int cpu_cache_ext_enabled;
 int cpu_flush_pending;
 int cpu_old_paging;

@@ -340,6 +340,8 @@ reset_common(int hard)
        kept is a cache still on. */
     cpu_cache_int_enabled = hascache && !(cr0 & (1 << 30));
     cpu_update_waitstates();
+    if (cpu_cache_hook)
+        cpu_cache_hook(CPU_CACHE_WBINVD);
     cr4              = 0;
     cpu_state.eflags = 0;
     cgate32          = 0;
@@ -365,6 +367,10 @@ reset_common(int hard)
             loadcs(0xF000);
         else
             loadcs_2386(0xF000);
+        /* 386+ RESET sets the CS base to FFFF0000: a CPU-only reset (port 92h, KBC) fetches from
+           the ROM even when the F segment is shadowed. */
+        if (is386 && !hard && mem_a20_state)
+            cpu_state.seg_cs.base = 0xffff0000;
         cpu_state.pc = 0xFFF0;
         if (hard) {
             rammask = cpu_16bitbus ? 0xFFFFFF : 0xFFFFFFFF;

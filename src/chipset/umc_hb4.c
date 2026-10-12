@@ -135,6 +135,22 @@ hb4_log(const char *fmt, ...)
 #    define hb4_log(fmt, ...)
 #endif
 
+#define L1_SETS 256 /* 16 KB, 4-way, 16-byte lines (Am5x86) */
+#define L1_WAYS 4
+
+typedef struct hb4_simm_t {
+    uint8_t  cols;
+    uint8_t  rows;
+    uint8_t  sides;
+    uint32_t offset; /* in simm_data */
+} hb4_simm_t;
+
+/* Device option value -> SIMM: column and row address bits, sides */
+static const hb4_simm_t simm_types[] = {
+    { 0 }, { 10, 10, 1 }, { 10, 10, 2 }, { 11, 11, 1 }, { 10, 12, 1 },
+    { 11, 11, 2 }, { 10, 12, 2 }, { 11, 12, 2 }, { 12, 12, 1 }, { 12, 12, 2 }
+};
+
 typedef struct hb4_t {
     uint8_t idx;
     uint8_t access_data;
@@ -148,6 +164,32 @@ typedef struct hb4_t {
     uint32_t smram_base;
 
     smram_t *smram;         /* SMRAM Handler */
+
+    /* DRAM/L2 model, see hb4_dram_decode() */
+    int           model;
+    hb4_simm_t    simm[4];
+    uint8_t      *simm_data;
+    uint32_t      l2_size; /* 0: none installed */
+    int           l2_banks;
+    uint8_t      *l2_data;
+    uint8_t       regs[3];      /* 52h, 53h, 61h */
+    int           flat;         /* one-to-one decode: data in 86Box RAM below flat_top, laid out by flat_regs */
+    int           overlay;      /* hb4_ram_* handlers in front of the RAM (cache-as-RAM, forced L2 hit) */
+    uint32_t      flat_top;
+    uint8_t       flat_regs[3];
+    mem_mapping_t low_mapping;
+    mem_mapping_t high_mapping;
+    uint32_t      stuck_addr; /* fault injection: this byte reads bit stuck_mask as 0; 0: none */
+    uint8_t       stuck_mask;
+    mem_mapping_t stuck_mapping;
+
+    /* Internal cache, for cache-as-RAM only: lines read after INVD, served while CR0.CD and NW are set */
+    uint32_t   l1_tag[L1_SETS][L1_WAYS];
+    uint8_t    l1_data[L1_SETS][L1_WAYS][16];
+    uint8_t    l1_next[L1_SETS];
+    int        l1_track;
+    int        l1_car;
+    pc_timer_t l1_timer;
 } hb4_t;
 
 static int shadow_bios[4]  = { (MEM_READ_EXTANY | MEM_WRITE_INTERNAL), (MEM_READ_EXTANY | MEM_WRITE_EXTANY),
@@ -270,6 +312,379 @@ hb4_smram(hb4_t *dev)
     flushmmucache();
 }
 
+/*
+   DRAM model (fork), enabled when a SIMM is set in the device options: CPU addresses are decoded to
+   SIMM cells as registers 52h/53h/61h program them, so a BIOS sizing the banks sees the aliases and
+   holes of real hardware (UM8881F documentation in the repository, coreboot_486 raminit):
+   52h bits 0-2/4-6: region L (at 0) and U (above L) of 1 << (20 + n) bytes, bit 3: banks 2-3 form L;
+   53h bits 0/2: two banks, 1/3: double sided, 4/5: upper bank of the pair; 61h bits 4/5: MA11.
+   Within a side, address bits 2-10 drive column MA0-8 and bits 11-20 row MA0-9; ma_high[] gives the
+   rest. While that decode is one-to-one the data is in flat 86Box RAM, else in simm_data. The hb4_ram_*
+   handlers serve 0-640K and 1M-256M when the decode is not one-to-one or the internal cache (as RAM)
+   or the L2 SRAM (forced hit) answers; code can only run from RAM while it is flat.
+*/
+#define MA_ROW 0x10
+#define MA_NC  0xff
+
+/* Address bits 21-25 -> MA line (column n or MA_ROW | row n), without and with 61h MA11 */
+static const uint8_t ma_high[2][5] = {
+    { 9, MA_ROW | 10, 10, MA_NC, MA_NC },
+    { MA_ROW | 10, MA_ROW | 11, 9, 10, 11 }
+};
+
+typedef struct hb4_region_t {
+    uint32_t       base;
+    uint32_t       size;    /* 0: disabled */
+    int            banks;   /* 1 or 2 */
+    int            sides;   /* 1 or 2 */
+    int            bits;    /* address bits of one side */
+    int            first;   /* SIMM of the region's first bank */
+    int            swap;    /* one bank: the upper of the pair */
+    const uint8_t *ma;
+} hb4_region_t;
+
+static hb4_region_t
+hb4_region(const uint8_t *regs, int upper)
+{
+    hb4_region_t r;
+    int          code_l = regs[0] & 7;
+    int          code   = upper ? ((regs[0] >> 4) & 7) : code_l;
+    int          cfg    = regs[1] >> (upper ? 2 : 0);
+
+    r.base  = (upper && code_l) ? (1u << (20 + code_l)) : 0;
+    r.size  = (code && code_l) ? (1u << (20 + code)) : 0; /* no region L: no RAM at all */
+    r.banks = (cfg & 1) ? 2 : 1;
+    r.sides = (cfg & 2) ? 2 : 1;
+    r.bits  = 20 + code - r.banks - r.sides + 2;
+    r.first = (upper ^ !!(regs[0] & 8)) * 2;
+    r.swap  = (regs[1] >> (upper ? 5 : 4)) & 1;
+    r.ma    = ma_high[(regs[2] >> (upper ? 5 : 4)) & 1];
+    return r;
+}
+
+static int
+hb4_ma_present(const hb4_simm_t *simm, uint8_t ma)
+{
+    if (ma == MA_NC)
+        return 0;
+    return (ma & MA_ROW) ? ((ma & 0x0f) < simm->rows) : (ma < simm->cols);
+}
+
+static int64_t
+hb4_dram_decode(const hb4_t *dev, const uint8_t *regs, uint32_t addr)
+{
+    hb4_region_t r = hb4_region(regs, 0);
+
+    if (addr - r.base >= r.size)
+        r = hb4_region(regs, 1);
+    if (addr - r.base >= r.size)
+        return -1;
+
+    uint32_t          offset = addr - r.base;
+    uint32_t          above  = offset >> r.bits; /* bank of the pair, then side */
+    int               bank   = ((r.banks == 2) ? (above >> (r.sides - 1)) : 0) ^ r.swap;
+    uint32_t          side   = above & (r.sides - 1);
+    const hb4_simm_t *simm   = &dev->simm[r.first + bank];
+    uint32_t          col    = (offset >> 2) & 0x1ff;
+    uint32_t          row    = (offset >> 11) & 0x3ff;
+
+    if (side >= simm->sides)
+        return -1;
+    for (int bit = 21; bit < MIN(r.bits, 26); bit++) {
+        uint8_t ma = r.ma[bit - 21];
+        if (((offset >> bit) & 1) && (ma != MA_NC)) {
+            if (ma & MA_ROW)
+                row |= 1 << (ma & 0x0f);
+            else
+                col |= 1 << ma;
+        }
+    }
+    col &= (1u << simm->cols) - 1;
+    row &= (1u << simm->rows) - 1;
+    return simm->offset + ((uint64_t) side << (simm->cols + simm->rows + 2)) +
+           ((((row << simm->cols) | col) << 2) | (addr & 3));
+}
+
+/* One-to-one decode: every bank used has the sides and every side address bit drives an MA line the
+   SIMM has. */
+static int
+hb4_region_flat(const hb4_t *dev, const uint8_t *regs, int upper)
+{
+    hb4_region_t r = hb4_region(regs, upper);
+
+    for (int bank = 0; r.size && (bank < 2); bank++) {
+        const hb4_simm_t *simm = &dev->simm[r.first + bank];
+        if ((r.banks == 1) && (bank != r.swap))
+            continue;
+        if (simm->sides < r.sides)
+            return 0;
+        for (int bit = 21; bit < r.bits; bit++)
+            if ((bit >= 26) || !hb4_ma_present(simm, r.ma[bit - 21]))
+                return 0;
+    }
+    return 1;
+}
+
+static int
+hb4_l2_forced(const hb4_t *dev)
+{
+    return dev->pci_conf[0x5a] & 0x40; /* even with the L2 disabled */
+}
+
+/* L2 data SRAM in forced hit mode: index wraps at the installed and at the programmed size; with two
+   banks A2 selects the bank, so a one-bank setting sees each cell twice. */
+static uint8_t *
+hb4_l2_byte(hb4_t *dev, uint32_t addr)
+{
+    uint8_t  r50  = dev->pci_conf[0x50];
+    uint32_t size = MIN(dev->l2_size, 0x8000u << (r50 & 7));
+
+    if (r50 & 0x08) {
+        if ((dev->l2_banks == 1) && (addr & 4))
+            return NULL;
+    } else if (dev->l2_banks == 2)
+        addr &= ~4;
+    return size ? &dev->l2_data[addr & (size - 1)] : NULL;
+}
+
+/* Behind the internal cache: L2 SRAM (forced hit), flat RAM or SIMM cells; unanswered reads float high. */
+static uint8_t
+hb4_load(hb4_t *dev, uint32_t addr)
+{
+    uint8_t *byte = NULL;
+
+    if (hb4_l2_forced(dev))
+        byte = hb4_l2_byte(dev, addr);
+    else if (dev->flat)
+        byte = (addr < dev->flat_top) ? &ram[addr] : NULL;
+    else {
+        int64_t offset = hb4_dram_decode(dev, dev->regs, addr);
+        byte           = (offset < 0) ? NULL : &dev->simm_data[offset];
+    }
+    return byte ? *byte : 0xff;
+}
+
+static void
+hb4_store(hb4_t *dev, uint32_t addr, uint8_t val)
+{
+    uint8_t *byte = NULL;
+
+    if (hb4_l2_forced(dev))
+        byte = hb4_l2_byte(dev, addr);
+    else if (dev->flat) {
+        if (addr < dev->flat_top)
+            mem_write_ramb_page(addr, val, &pages[addr >> 12]); /* tracks code pages */
+    } else {
+        int64_t offset = hb4_dram_decode(dev, dev->regs, addr);
+        byte           = (offset < 0) ? NULL : &dev->simm_data[offset];
+    }
+    if (byte)
+        *byte = val;
+}
+
+static uint8_t *
+hb4_l1_line(hb4_t *dev, uint32_t addr, int read)
+{
+    uint32_t tag = (addr & ~15) | 1;
+    uint32_t set = (addr >> 4) % L1_SETS;
+
+    for (int way = 0; way < L1_WAYS; way++)
+        if (dev->l1_tag[set][way] == tag)
+            return dev->l1_car ? dev->l1_data[set][way] : NULL;
+    if (read && dev->l1_track)
+        dev->l1_tag[set][dev->l1_next[set]++ % L1_WAYS] = tag;
+    return NULL;
+}
+
+static uint8_t
+hb4_ram_readb(uint32_t addr, void *priv)
+{
+    hb4_t   *dev  = (hb4_t *) priv;
+    uint8_t *line = hb4_l1_line(dev, addr, 1);
+
+    return line ? line[addr & 15] : hb4_load(dev, addr);
+}
+
+static uint16_t
+hb4_ram_readw(uint32_t addr, void *priv)
+{
+    return hb4_ram_readb(addr, priv) | (hb4_ram_readb(addr + 1, priv) << 8);
+}
+
+static uint32_t
+hb4_ram_readl(uint32_t addr, void *priv)
+{
+    return hb4_ram_readw(addr, priv) | ((uint32_t) hb4_ram_readw(addr + 2, priv) << 16);
+}
+
+static void
+hb4_ram_writeb(uint32_t addr, uint8_t val, void *priv)
+{
+    hb4_t   *dev  = (hb4_t *) priv;
+    uint8_t *line = hb4_l1_line(dev, addr, 0);
+
+    if (line)
+        line[addr & 15] = val;
+    else
+        hb4_store(dev, addr, val);
+}
+
+static void
+hb4_ram_writew(uint32_t addr, uint16_t val, void *priv)
+{
+    hb4_ram_writeb(addr, val, priv);
+    hb4_ram_writeb(addr + 1, val >> 8, priv);
+}
+
+static void
+hb4_ram_writel(uint32_t addr, uint32_t val, void *priv)
+{
+    hb4_ram_writew(addr, val, priv);
+    hb4_ram_writew(addr + 2, val >> 16, priv);
+}
+
+static uint8_t
+hb4_stuck_readb(uint32_t addr, void *priv)
+{
+    hb4_t  *dev = (hb4_t *) priv;
+    uint8_t val = hb4_ram_readb(addr, priv);
+
+    return (addr == dev->stuck_addr) ? (val & ~dev->stuck_mask) : val;
+}
+
+static uint16_t
+hb4_stuck_readw(uint32_t addr, void *priv)
+{
+    return hb4_stuck_readb(addr, priv) | (hb4_stuck_readb(addr + 1, priv) << 8);
+}
+
+static uint32_t
+hb4_stuck_readl(uint32_t addr, void *priv)
+{
+    return hb4_stuck_readw(addr, priv) | ((uint32_t) hb4_stuck_readw(addr + 2, priv) << 16);
+}
+
+/* Copies flat 86Box RAM from (to_ram: to) the SIMMs; 2 KB runs are contiguous in both. */
+static void
+hb4_ram_copy(hb4_t *dev, const uint8_t *regs, uint32_t top, int to_ram)
+{
+    for (uint32_t addr = 0; addr < top; addr += 0x800) {
+        if (addr == 0xa0000)
+            addr = 0x100000;
+
+        int64_t offset = hb4_dram_decode(dev, regs, addr);
+        if (offset < 0)
+            fatal("UMC HB4: flat RAM at %08X not decoded\n", addr);
+        if (to_ram)
+            memcpy(ram + addr, dev->simm_data + offset, 0x800);
+        else
+            memcpy(dev->simm_data + offset, ram + addr, 0x800);
+    }
+    if (to_ram)
+        mem_invalidate_range(0, top - 1);
+}
+
+static void
+hb4_ram_update(hb4_t *dev)
+{
+    const uint8_t *regs = dev->regs;
+
+    dev->regs[0]     = dev->pci_conf[0x52];
+    dev->regs[1]     = dev->pci_conf[0x53];
+    dev->regs[2]     = dev->pci_conf[0x61];
+    uint32_t top     = hb4_region(regs, 0).size + hb4_region(regs, 1).size;
+    int      flat    = (top >= 0x100000) && (top <= mem_size * 1024) && hb4_region_flat(dev, regs, 0) &&
+                       hb4_region_flat(dev, regs, 1);
+    int      overlay = dev->l1_track || dev->l1_car || hb4_l2_forced(dev);
+
+    if ((flat != dev->flat) || (flat && memcmp(regs, dev->flat_regs, 3))) {
+        if (dev->flat)
+            hb4_ram_copy(dev, dev->flat_regs, dev->flat_top, 0);
+        dev->flat = flat;
+        if (flat) {
+            memcpy(dev->flat_regs, regs, 3);
+            dev->flat_top = top;
+            hb4_ram_copy(dev, regs, top, 1);
+            /* PCI memory may sit between the RAM top and the 86Box RAM size */
+            mem_set_mem_state_both(0x100000, top - 0x100000, MEM_READ_INTERNAL | MEM_WRITE_INTERNAL);
+            mem_set_mem_state_both(top, mem_size * 1024 - top, MEM_READ_EXTERNAL | MEM_WRITE_EXTERNAL);
+        }
+    } else if (overlay == dev->overlay)
+        return;
+
+    dev->overlay = overlay;
+    if (flat && !overlay) {
+        mem_mapping_disable(&dev->low_mapping);
+        mem_mapping_disable(&dev->high_mapping);
+        mem_mapping_set_addr(&ram_high_mapping, 0x100000, top - 0x100000);
+    } else {
+        mem_mapping_set_exec(&dev->low_mapping, flat ? ram : NULL);
+        mem_mapping_enable(&dev->low_mapping);
+        mem_mapping_set_addr(&dev->high_mapping, 0x100000, (flat ? top : 0x10000000) - 0x100000);
+        mem_mapping_set_exec(&dev->high_mapping, flat ? (ram + 0x100000) : NULL);
+    }
+    if (dev->stuck_addr)
+        mem_mapping_set_exec(&dev->stuck_mapping, flat ? (ram + (dev->stuck_addr & ~0xfff)) : NULL);
+    flushmmucache();
+}
+
+static hb4_t *hb4_model;
+
+static void
+hb4_l1_lines(hb4_t *dev, int to_l1)
+{
+    for (int set = 0; set < L1_SETS; set++)
+        for (int way = 0; way < L1_WAYS; way++)
+            for (int i = 0; dev->l1_tag[set][way] && (i < 16); i++) {
+                uint32_t addr = (dev->l1_tag[set][way] & ~15) + i;
+                if (to_l1)
+                    dev->l1_data[set][way][i] = hb4_load(dev, addr);
+                else
+                    hb4_store(dev, addr, dev->l1_data[set][way][i]);
+            }
+}
+
+/* CPU cache events: INVD starts recording the lines filled, setting CR0.CD and NW then turns them into
+   cache-as-RAM until the next invalidation; leaving that mode keeps what the CPU saw. */
+static void
+hb4_cache_event(int event)
+{
+    hb4_t *dev = hb4_model;
+    int    car = (cr0 & 0x60000000) == 0x60000000;
+
+    if (event != CPU_CACHE_CR0) {
+        memset(dev->l1_tag, 0, sizeof(dev->l1_tag));
+        dev->l1_car   = 0;
+        dev->l1_track = event == CPU_CACHE_INVD;
+        if (dev->l1_track)
+            timer_on_auto(&dev->l1_timer, 10000.0);
+    } else if (dev->l1_track && (cr0 & 0x40000000)) {
+        dev->l1_track = 0;
+        dev->l1_car   = car;
+        if (car)
+            hb4_l1_lines(dev, 1);
+        else
+            memset(dev->l1_tag, 0, sizeof(dev->l1_tag));
+    } else if (dev->l1_car && !car) {
+        hb4_l1_lines(dev, 0);
+        memset(dev->l1_tag, 0, sizeof(dev->l1_tag));
+        dev->l1_car = 0;
+    }
+    hb4_ram_update(dev);
+}
+
+static void
+hb4_l1_timeout(void *priv)
+{
+    hb4_t *dev = (hb4_t *) priv;
+
+    if (dev->l1_track) {
+        dev->l1_track = 0;
+        memset(dev->l1_tag, 0, sizeof(dev->l1_tag));
+        hb4_ram_update(dev);
+    }
+}
+
 static void
 hb4_write(UNUSED(int func), int addr, UNUSED(int len), uint8_t val, void *priv)
 {
@@ -293,13 +708,21 @@ hb4_write(UNUSED(int func), int addr, UNUSED(int len), uint8_t val, void *priv)
             break;
 
         case 0x50:
-            dev->pci_conf[addr]   = ((val & 0xf8) | 4); /* Hardcode Cache Size to 512KB */
+            dev->pci_conf[addr]   = dev->model ? val : ((val & 0xf8) | 4); /* Hardcode Cache Size to 512KB */
             cpu_cache_ext_enabled = !!(val & 0x80);     /* Fixes freezing issues on the HOT-433A*/
             cpu_update_waitstates();
+            if (dev->model)
+                hb4_ram_update(dev);
             break;
 
-        case 0x51 ... 0x53:
+        case 0x51:
             dev->pci_conf[addr] = val;
+            break;
+
+        case 0x52 ... 0x53:
+            dev->pci_conf[addr] = val;
+            if (dev->model)
+                hb4_ram_update(dev);
             break;
 
         case 0x54 ... 0x55:
@@ -307,9 +730,15 @@ hb4_write(UNUSED(int func), int addr, UNUSED(int len), uint8_t val, void *priv)
             hb4_shadow(dev);
             break;
 
-        case 0x56 ... 0x5a:
+        case 0x56 ... 0x59:
         case 0x5e ... 0x5f:
             dev->pci_conf[addr] = val;
+            break;
+
+        case 0x5a:
+            dev->pci_conf[addr] = val;
+            if (dev->model)
+                hb4_ram_update(dev);
             break;
 
         case 0x5c ... 0x5d:
@@ -320,6 +749,8 @@ hb4_write(UNUSED(int func), int addr, UNUSED(int len), uint8_t val, void *priv)
 
         case 0x61:
             dev->pci_conf[addr] = val;
+            if (dev->model)
+                hb4_ram_update(dev);
             break;
 
         case 0x62:
@@ -385,6 +816,13 @@ hb4_reset(void *priv)
     cpu_update_waitstates();
 
     memset(dev->mem_state, 0x00, sizeof(dev->mem_state));
+
+    if (dev->model) {
+        memset(dev->l1_tag, 0, sizeof(dev->l1_tag));
+        dev->l1_track = dev->l1_car = 0;
+        timer_disable(&dev->l1_timer);
+        hb4_ram_update(dev);
+    }
 }
 
 static void
@@ -392,6 +830,16 @@ hb4_close(void *priv)
 {
     hb4_t *dev = (hb4_t *) priv;
 
+    if (dev->model) {
+        cpu_cache_hook = NULL;
+        timer_disable(&dev->l1_timer);
+        mem_mapping_disable(&dev->low_mapping);
+        mem_mapping_disable(&dev->high_mapping);
+        if (dev->stuck_addr)
+            mem_mapping_disable(&dev->stuck_mapping);
+        free(dev->simm_data);
+        free(dev->l2_data);
+    }
     smram_del(dev->smram);
     free(dev);
 }
@@ -410,10 +858,103 @@ hb4_init(UNUSED(const device_t *info))
     dev->smram = smram_add();
 
     dev->smram_base = 0x000a0000;
+
+    uint32_t capacity = 0;
+    for (int bank = 0; bank < 4; bank++) {
+        char name[8];
+        int  type = (snprintf(name, sizeof(name), "bank%d", bank), device_get_config_int(name));
+        if ((type < 0) || (type >= (int) (sizeof(simm_types) / sizeof(simm_types[0]))))
+            fatal("UMC HB4: bad SIMM type %d in bank %d\n", type, bank);
+        dev->simm[bank]        = simm_types[type];
+        dev->simm[bank].offset = capacity;
+        if (type)
+            capacity += dev->simm[bank].sides << (dev->simm[bank].cols + dev->simm[bank].rows + 2);
+    }
+    dev->model = capacity > 0;
+    if (dev->model) {
+        dev->l2_size   = device_get_config_int("l2_cache") << 10;
+        dev->l2_banks  = device_get_config_int("l2_banks");
+        dev->simm_data = calloc(1, capacity);
+        dev->l2_data   = calloc(1, 1 << 20);
+        if (!dev->simm_data || !dev->l2_data)
+            fatal("UMC HB4: out of memory for %u MB of SIMMs\n", capacity >> 20);
+        mem_mapping_add(&dev->low_mapping, 0, 0xa0000, hb4_ram_readb, hb4_ram_readw, hb4_ram_readl,
+                        hb4_ram_writeb, hb4_ram_writew, hb4_ram_writel, NULL, 0, dev);
+        mem_mapping_add(&dev->high_mapping, 0x100000, 0x0ff00000, hb4_ram_readb, hb4_ram_readw, hb4_ram_readl,
+                        hb4_ram_writeb, hb4_ram_writew, hb4_ram_writel, NULL, 0, dev);
+        mem_mapping_disable(&dev->low_mapping);
+        mem_mapping_disable(&dev->high_mapping);
+        dev->stuck_addr = device_get_config_int("stuck_addr");
+        dev->stuck_mask = 1 << device_get_config_int("stuck_bit");
+        if (dev->stuck_addr) /* added last: in front of the RAM and the mappings above */
+            mem_mapping_add(&dev->stuck_mapping, dev->stuck_addr & ~0xfff, 0x1000, hb4_stuck_readb,
+                            hb4_stuck_readw, hb4_stuck_readl, hb4_ram_writeb, hb4_ram_writew, hb4_ram_writel,
+                            NULL, 0, dev);
+        timer_add(&dev->l1_timer, hb4_l1_timeout, dev, 0);
+        hb4_model      = dev;
+        cpu_cache_hook = hb4_cache_event;
+    }
     hb4_reset(dev);
 
     return dev;
 }
+
+#define HB4_BANK(n)                                                                   \
+    {                                                                                 \
+        .name = "bank" #n, .description = "SIMM bank " #n, .type = CONFIG_SELECTION,  \
+        .default_int = 0, .selection = {                                              \
+            { .description = "Empty", .value = 0 },                                  \
+            { .description = "4 MB, row/column bits 10/10", .value = 1 },             \
+            { .description = "8 MB, 10/10, double sided", .value = 2 },               \
+            { .description = "16 MB, 11/11", .value = 3 },                            \
+            { .description = "16 MB, 12/10", .value = 4 },                            \
+            { .description = "32 MB, 11/11, double sided", .value = 5 },              \
+            { .description = "32 MB, 12/10, double sided", .value = 6 },              \
+            { .description = "64 MB, 12/11, double sided", .value = 7 },              \
+            { .description = "64 MB, 12/12", .value = 8 },                            \
+            { .description = "128 MB, 12/12, double sided", .value = 9 },             \
+            { .description = "" } }                                                   \
+    }
+
+/* All banks empty: no DRAM/L2 model, flat RAM of the machine size. */
+static const device_config_t hb4_config[] = {
+    HB4_BANK(0), HB4_BANK(1), HB4_BANK(2), HB4_BANK(3),
+    {
+        .name = "l2_cache", .description = "L2 cache (with SIMMs set)", .type = CONFIG_SELECTION,
+        .default_int = 256, .selection = {
+            { .description = "None", .value = 0 },
+            { .description = "64 KB", .value = 64 },
+            { .description = "128 KB", .value = 128 },
+            { .description = "256 KB", .value = 256 },
+            { .description = "512 KB", .value = 512 },
+            { .description = "1 MB", .value = 1024 },
+            { .description = "" } }
+    },
+    {
+        .name = "l2_banks", .description = "L2 cache banks", .type = CONFIG_SELECTION,
+        .default_int = 1, .selection = {
+            { .description = "1", .value = 1 },
+            { .description = "2", .value = 2 },
+            { .description = "" } }
+    },
+    {
+        .name = "stuck_addr", .description = "Faulty RAM byte (any address in the .cfg)", .type = CONFIG_SELECTION,
+        .default_int = 0, .selection = {
+            { .description = "None", .value = 0 },
+            { .description = "2AA400h", .value = 0x2aa400 },
+            { .description = "" } }
+    },
+    {
+        .name = "stuck_bit", .description = "Faulty RAM bit (reads 0)", .type = CONFIG_SELECTION,
+        .default_int = 3, .selection = {
+            { .description = "0", .value = 0 }, { .description = "1", .value = 1 },
+            { .description = "2", .value = 2 }, { .description = "3", .value = 3 },
+            { .description = "4", .value = 4 }, { .description = "5", .value = 5 },
+            { .description = "6", .value = 6 }, { .description = "7", .value = 7 },
+            { .description = "" } }
+    },
+    { .name = "", .description = "", .type = CONFIG_END }
+};
 
 const device_t umc_hb4_device = {
     .name          = "UMC HB4(8881F)",
@@ -426,5 +967,5 @@ const device_t umc_hb4_device = {
     .available     = NULL,
     .speed_changed = NULL,
     .force_redraw  = NULL,
-    .config        = NULL
+    .config        = hb4_config
 };
