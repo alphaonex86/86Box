@@ -77,6 +77,8 @@
 #define WIN_READ_EXT                   0x24 /* 48-Bit Read */
 #define WIN_WRITE_EXT                  0x34 /* 48-Bit Write */
 #define WIN_VERIFY_EXT                 0x42 /* 48-Bit Verify */
+#define WIN_READ_MULTIPLE_EXT          0x29 /* 48-Bit Read Multiple */
+#define WIN_WRITE_MULTIPLE_EXT         0x39 /* 48-Bit Write Multiple */
 #define WIN_WRITE                      0x30 /* 28-Bit Write */
 #define WIN_WRITE_NORETRY              0x31 /* 28-Bit Write - no retry */
 #define WIN_VERIFY                     0x40 /* 28-Bit Verify */
@@ -803,8 +805,15 @@ ide_get_sector_format(ide_t *ide)
 static void
 ide_ext_start(ide_t *ide, uint8_t *cmd)
 {
-    if ((ide->type != IDE_HDD) ||
-        ((*cmd != WIN_READ_EXT) && (*cmd != WIN_WRITE_EXT) && (*cmd != WIN_VERIFY_EXT)))
+    static const uint8_t ext[][2] = { { WIN_READ_EXT, WIN_READ }, { WIN_WRITE_EXT, WIN_WRITE },
+                                      { WIN_VERIFY_EXT, WIN_VERIFY },
+                                      { WIN_READ_MULTIPLE_EXT, WIN_READ_MULTIPLE },
+                                      { WIN_WRITE_MULTIPLE_EXT, WIN_WRITE_MULTIPLE } };
+    int i = 0;
+    ide->ext_left = 0;
+    while ((i < 5) && (ext[i][0] != *cmd))
+        i++;
+    if ((ide->type != IDE_HDD) || (i == 5))
         return;
     uint32_t count = (ide->hob[0] << 8) | ide->tf->secount;
     if (!count)
@@ -814,7 +823,7 @@ ide_ext_start(ide_t *ide, uint8_t *cmd)
     ide->tf->lba     = 1;
     ide->tf->secount = (count > 256 ? 256 : count) & 0xff;
     ide->ext_left    = count > 256 ? count - 256 : 0;
-    *cmd = (*cmd == WIN_READ_EXT) ? WIN_READ : (*cmd == WIN_WRITE_EXT) ? WIN_WRITE : WIN_VERIFY;
+    *cmd = ext[i][1];
 }
 
 /* End of a segment: start the next one of an LBA48 command; returns 1 if there is one. */
@@ -1457,7 +1466,7 @@ ide_write_data(ide_t *ide, const uint16_t val)
                     if (hdd[ide->hdd_num].speed_preset == 0) {
                         ide->pending_delay = 0;
                         ide_callback(ide);
-                    } else if ((ide->blockcount + 1) >= ide->blocksize || ide->tf->secount == 1) {
+                    } else if ((ide->blockcount + 1) >= ide->blocksize || (ide->tf->secount == 1 && !ide->ext_left)) {
                         ide_set_callback(ide, seek_time + xfer_time + ide->pending_delay);
                         ide->pending_delay = 0;
                     } else {
@@ -2702,11 +2711,12 @@ ide_callback(void *priv)
             else {
                 ret = hdd_image_write(ide->hdd_num, ide_get_sector(ide), 1, (uint8_t *) ide->buffer);
                 ide->blockcount++;
-                if (ide->blockcount >= ide->blocksize || ide->tf->secount == 1) {
+                if (ide->blockcount >= ide->blocksize || (ide->tf->secount == 1 && !ide->ext_left)) {
                     ide->blockcount = 0;
                     ide_irq_raise(ide);
                 }
                 ide->tf->secount--;
+                ide_ext_next(ide);
                 if (ide->tf->secount) {
                     ide->tf->atastat = DRQ_STAT | DRDY_STAT | DSC_STAT;
                     ide->tf->pos     = 0;

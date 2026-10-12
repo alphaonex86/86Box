@@ -6,7 +6,8 @@
  *
  *          This file is part of the 86Box distribution.
  *
- *          Emulation of Realtek RTL8139C+ NIC.
+ *          Emulation of Realtek RTL8139C+ NIC, and of the RTL8169S gigabit NIC
+ *          (same C+ descriptor rings, PHY through PHYAR).
  *
  * Authors: Igor Kovalenko,
  *          Mark Malakanov,
@@ -51,6 +52,7 @@
 #include <86box/bswap.h>
 
 #define ROM_PATH_RTL8139 "roms/network/rtl8139c/rtl8139c.rom"
+#define ROM_PATH_RTL8169 "roms/network/rtl8169/rtl8169.rom"
 
 #define PCI_PERIOD 30 /* 30 ns period = 33.333333 Mhz frequency */
 
@@ -135,6 +137,16 @@ enum RTL8139_registers {
     RxRingAddrHI = 0xE8, /* 64-bit start addr of Rx ring */
     TxThresh     = 0xEC, /* Early Tx threshold */
 };
+
+/* RTL8169 registers at offsets the RTL8139 uses for something else */
+enum RTL8169_registers {
+    TxPoll8169 = 0x38,
+    PHYAR      = 0x60, /* PHY access: bit 31 = write (cleared when done) / read done, 20-16 register */
+    PHYstatus  = 0x6C,
+};
+
+/* RTL8169S, XID 008 in TxConfig bits 30-26, 23-20: Linux r8169 "RTL8169s", iPXE realtek */
+#define RTL8169S_TXCONFIG 0x00800000
 
 enum ClearBitMasks {
     MultiIntrClear = 0xF000,
@@ -475,6 +487,11 @@ struct RTL8139State {
 
     nmc93cxx_eeprom_t *eeprom;
     uint8_t            eeprom_data[128];
+
+    int      rtl8169;
+    uint32_t phyar;
+    uint16_t phy[32]; /* page 0 of the gigabit PHY; register 31 selects the page */
+    uint16_t RxMaxSize;
 };
 
 /* Writes tally counters to memory via DMA */
@@ -516,16 +533,17 @@ rtl8139_transmitter_enabled(RTL8139State *s)
     return s->bChipCmdState & CmdTxEnb;
 }
 
+/* The RTL8169 only has the C+ descriptor rings. */
 static int
 rtl8139_cp_receiver_enabled(RTL8139State *s)
 {
-    return s->CpCmd & CPlusRxEnb;
+    return s->rtl8169 || (s->CpCmd & CPlusRxEnb);
 }
 
 static int
 rtl8139_cp_transmitter_enabled(RTL8139State *s)
 {
-    return s->CpCmd & CPlusTxEnb;
+    return s->rtl8169 || (s->CpCmd & CPlusTxEnb);
 }
 
 static void
@@ -838,7 +856,9 @@ rtl8139_do_receive(void *priv, uint8_t *buf, int size_)
             return size_;
         }
 
-        uint32_t rx_space = rxdw0 & CP_RX_BUFFER_SIZE_MASK;
+        /* the RTL8169 has a 14-bit length, so its status bits are one higher */
+        uint32_t size_mask = s->rtl8169 ? 0x3fff : CP_RX_BUFFER_SIZE_MASK;
+        uint32_t rx_space  = rxdw0 & size_mask;
 
         /* write VLAN info to descriptor variables. */
         if (s->CpCmd & CPlusRxVLAN && bswap16(AS_U16(buf[ETH_ALEN * 2])) == 0x8100) {
@@ -930,14 +950,14 @@ rtl8139_do_receive(void *priv, uint8_t *buf, int size_)
 
         /* set received packet type flags */
         if (packet_header & RxBroadcast)
-            rxdw0 |= CP_RX_STATUS_BAR;
+            rxdw0 |= CP_RX_STATUS_BAR << s->rtl8169;
         if (packet_header & RxMulticast)
-            rxdw0 |= CP_RX_STATUS_MAR;
+            rxdw0 |= CP_RX_STATUS_MAR << s->rtl8169;
         if (packet_header & RxPhysical)
-            rxdw0 |= CP_RX_STATUS_PAM;
+            rxdw0 |= CP_RX_STATUS_PAM << s->rtl8169;
 
         /* set received size */
-        rxdw0 &= ~CP_RX_BUFFER_SIZE_MASK;
+        rxdw0 &= ~size_mask;
         rxdw0 |= (size + 4);
 
         /* update ring data */
@@ -1021,8 +1041,23 @@ rtl8139_reset_rxring(RTL8139State *s, uint32_t bufferSize)
 }
 
 static void
+rtl8169_reset_phy(RTL8139State *s)
+{
+    memset(s->phy, 0, sizeof(s->phy));
+    s->phy[0]  = 0x1140; /* autonegotiation, full duplex, 1000 Mbps */
+    s->phy[2]  = 0x001c; /* PHY ID of the RTL8169S/8110S internal PHY (Linux: RTL8211) */
+    s->phy[3]  = 0xc910;
+    s->phy[4]  = 0x01e1; /* advertise 10/100 half and full duplex */
+    s->phy[9]  = 0x0300; /* advertise 1000 half and full duplex */
+    s->phy[15] = 0x3000; /* 1000BASE-T half and full duplex capable */
+}
+
+static void
 rtl8139_reset_phy(RTL8139State *s)
 {
+    if (s->rtl8169)
+        rtl8169_reset_phy(s);
+
     s->BasicModeStatus = 0x7809;
     s->BasicModeStatus |= 0x0020; /* autonegotiation completed */
     /* preserve link state */
@@ -1069,7 +1104,7 @@ rtl8139_reset(void *priv)
 //    s->TxConfig |= HW_REVID(1, 0, 0, 0, 0, 0, 0); // RTL-8139  HasHltClk
     s->clock_enabled = 0;
 #else
-    s->TxConfig |= HW_REVID(1, 1, 1, 0, 1, 1, 0); // RTL-8139C+ HasLWake
+    s->TxConfig |= s->rtl8169 ? RTL8169S_TXCONFIG : HW_REVID(1, 1, 1, 0, 1, 1, 0); // RTL-8139C+ HasLWake
     s->clock_enabled = 1;
 #endif
 
@@ -1082,7 +1117,7 @@ rtl8139_reset(void *priv)
     s->Config5 = 0x0;
 
     s->CpCmd         = 0x0; /* reset C+ mode */
-    s->cplus_enabled = 0;
+    s->cplus_enabled = s->rtl8169;
 
 #if 0
     s->BasicModeCtrl = 0x2100; // 100Mbps, full duplex
@@ -1831,7 +1866,7 @@ rtl8139_cplus_transmit_one(RTL8139State *s)
         s->currCPlusTxDesc = 0;
     } else {
         ++s->currCPlusTxDesc;
-        if (s->currCPlusTxDesc >= 64)
+        if (s->currCPlusTxDesc >= (s->rtl8169 ? 1024 : 64))
             s->currCPlusTxDesc = 0;
     }
 
@@ -2477,12 +2512,89 @@ rtl8139_MultiIntr_read(RTL8139State *s)
     return ret;
 }
 
+static int
+rtl8169_link_up(RTL8139State *s)
+{
+    return !(net_cards_conf[s->nic->card_num].link_state & NET_LINK_DOWN);
+}
+
+/* Gigabit PHY with autonegotiation always complete against a 10/100/1000 full and half duplex partner. */
+static uint16_t
+rtl8169_phy_read(RTL8139State *s, int reg)
+{
+    if (s->phy[31] && reg != 31)
+        return 0; /* vendor pages */
+
+    switch (reg) {
+        case 1:
+            return rtl8169_link_up(s) ? 0x796d : 0x7949; /* link, autonegotiation complete */
+        case 5:
+            return rtl8169_link_up(s) ? 0x41e1 : 0;
+        case 10:
+            return rtl8169_link_up(s) ? 0x3c00 : 0;
+        default:
+            return s->phy[reg];
+    }
+}
+
+static void
+rtl8169_phy_write(RTL8139State *s, int reg, uint16_t val)
+{
+    if (s->phy[31] && reg != 31)
+        return; /* vendor pages */
+
+    if (reg == 0 && (val & 0x8000))
+        rtl8169_reset_phy(s);
+    else if (reg == 0)
+        s->phy[0] = val & ~0x0200; /* autonegotiation restart completes at once */
+    else if (reg != 2 && reg != 3 && reg != 15) /* PHY ID, extended status */
+        s->phy[reg] = val;
+}
+
+/* RTL8169 registers the RTL8139 decodes differently; returns 0 for a register both chips share. */
+static int
+rtl8169_io_write(RTL8139State *s, uint32_t addr, uint32_t val, int len)
+{
+    if (addr == TxPoll8169 && len == 1) {
+        if (val & 0x40) /* normal priority queue */
+            rtl8139_cplus_transmit(s);
+    } else if (addr == PHYAR && len == 4) {
+        int reg = (val >> 16) & 0x1f;
+
+        if (val & 0x80000000) {
+            rtl8169_phy_write(s, reg, val);
+            s->phyar = val & 0x7fffffff;
+        } else
+            s->phyar = 0x80000000 | (reg << 16) | rtl8169_phy_read(s, reg);
+    } else if (addr == RxMaxSize && len == 2)
+        s->RxMaxSize = val;
+    else
+        return 0;
+    return 1;
+}
+
+static int
+rtl8169_io_read(RTL8139State *s, uint32_t addr, int len, uint32_t *val)
+{
+    if (addr == PHYAR && len == 4)
+        *val = s->phyar;
+    else if (addr == PHYstatus && len == 1)
+        *val = rtl8169_link_up(s) ? 0x13 : 0; /* 1000 Mbps full duplex, link */
+    else if (addr == RxMaxSize && len == 2)
+        *val = s->RxMaxSize;
+    else
+        return 0;
+    return 1;
+}
+
 static void
 rtl8139_io_writeb(uint32_t addr, uint8_t val, void *priv)
 {
     RTL8139State *s = priv;
 
     addr &= 0xFF;
+    if (s->rtl8169 && rtl8169_io_write(s, addr, val, 1))
+        return;
     switch (addr) {
         case MAC0 ... MAC0 + 4:
             s->phys[addr - MAC0] = val;
@@ -2573,6 +2685,8 @@ rtl8139_io_writew(uint32_t addr, uint16_t val, void *priv)
     RTL8139State *s = priv;
 
     addr &= 0xFF;
+    if (s->rtl8169 && rtl8169_io_write(s, addr, val, 2))
+        return;
     switch (addr) {
         case IntrMask:
             rtl8139_IntrMask_write(s, val);
@@ -2634,6 +2748,8 @@ rtl8139_io_writel(uint32_t addr, uint32_t val, void *priv)
     RTL8139State *s = priv;
 
     addr &= 0xFF;
+    if (s->rtl8169 && rtl8169_io_write(s, addr, val, 4))
+        return;
     switch (addr) {
         case RxMissed:
             rtl8139_log("RxMissed clearing on write\n");
@@ -2701,8 +2817,11 @@ rtl8139_io_readb(uint32_t addr, void *priv)
 {
     RTL8139State *s = priv;
     uint8_t       ret;
+    uint32_t      val;
 
     addr &= 0xFF;
+    if (s->rtl8169 && rtl8169_io_read(s, addr, 1, &val))
+        return val;
     switch (addr) {
         case MAC0 ... MAC0 + 5:
             ret = s->phys[addr - MAC0];
@@ -2786,8 +2905,11 @@ rtl8139_io_readw(uint32_t addr, void *priv)
 {
     RTL8139State *s = priv;
     uint16_t      ret;
+    uint32_t      val;
 
     addr &= 0xFF;
+    if (s->rtl8169 && rtl8169_io_read(s, addr, 2, &val))
+        return val;
     switch (addr) {
         case TxAddr0 ... TxAddr0 + 4 * 4 - 1:
             ret = rtl8139_TxStatus_TxAddr_read(s, s->TxAddr, TxAddr0, addr, 2);
@@ -2867,6 +2989,8 @@ rtl8139_io_readl(uint32_t addr, void *priv)
     uint32_t      ret;
 
     addr &= 0xFF;
+    if (s->rtl8169 && rtl8169_io_read(s, addr, 4, &ret))
+        return ret;
     switch (addr) {
         case RxMissed:
             ret = s->RxMissed;
@@ -3148,7 +3272,7 @@ rtl8139_pci_read(UNUSED(int func), int addr, UNUSED(int len), void *priv)
         case 0x01:
             return 0x10;
         case 0x02:
-            return 0x39;
+            return s->rtl8169 ? 0x69 : 0x39;
         case 0x03:
             return 0x81;
         case 0x07:
@@ -3182,7 +3306,7 @@ rtl8139_pci_read(UNUSED(int func), int addr, UNUSED(int len), void *priv)
         case 0x2d:
             return 0x10;
         case 0x2e:
-            return 0x39;
+            return s->rtl8169 ? 0x69 : 0x39;
         case 0x2f:
             return 0x81;
         case 0x30 ... 0x33:
@@ -3269,6 +3393,7 @@ static void *
 nic_init(const device_t *info)
 {
     RTL8139State *s                     = calloc(1, sizeof(RTL8139State));
+    const char   *rom_path              = info->local ? ROM_PATH_RTL8169 : ROM_PATH_RTL8139;
     nmc93cxx_eeprom_params_t params;
     char          eeprom_filename[1024] = { 0 };
     char          filename[1024] = { 0 };
@@ -3281,7 +3406,8 @@ nic_init(const device_t *info)
                     rtl8139_io_writeb_mem, rtl8139_io_writew_mem, rtl8139_io_writel_mem,
                     NULL, MEM_MAPPING_EXTERNAL, s);
     pci_add_card(PCI_ADD_NORMAL, rtl8139_pci_read, rtl8139_pci_write, s, &s->pci_slot);
-    s->inst = device_get_instance();
+    s->inst    = device_get_instance();
+    s->rtl8169 = info->local;
 
     snprintf(eeprom_filename, sizeof(eeprom_filename), "eeprom_rtl8139c_plus_%d.nvr", s->inst);
 
@@ -3292,7 +3418,7 @@ nic_init(const device_t *info)
 
     /* PCI vendor and device ID should be mirrored here */
     eep_data[1] = 0x10EC;
-    eep_data[2] = 0x8139;
+    eep_data[2] = s->rtl8169 ? 0x8169 : 0x8139;
 
     /* XXX: Get proper MAC addresses from real EEPROM dumps. OID is generic Realtek */
     eep_data[7] = 0xe000;
@@ -3330,18 +3456,18 @@ nic_init(const device_t *info)
     s->eeprom = device_add_inst_params(&nmc93cxx_device, s->inst, &params);
 
     if (device_get_config_int("bios")) {
-        FILE *fp = rom_fopen(ROM_PATH_RTL8139, "rb");
+        FILE *fp = rom_fopen(rom_path, "rb");
         if (fp) {
             fseek(fp, 0, SEEK_END);
             long len = ftell(fp);
             fclose(fp);
             for (s->boot_rom_size = 0x2000; s->boot_rom_size < len && s->boot_rom_size < 0x20000;)
                 s->boot_rom_size <<= 1;
-            rom_init(&s->boot_rom, ROM_PATH_RTL8139, 0, s->boot_rom_size, s->boot_rom_size - 1, 0,
+            rom_init(&s->boot_rom, rom_path, 0, s->boot_rom_size, s->boot_rom_size - 1, 0,
                      MEM_MAPPING_EXTERNAL);
             mem_mapping_disable(&s->boot_rom.mapping);
         } else
-            pclog("RTL8139: boot ROM %s not found\n", ROM_PATH_RTL8139);
+            pclog("%s: boot ROM %s not found\n", info->name, rom_path);
     }
 
     s->nic = network_attach(s, (uint8_t *) &s->phys[MAC0], rtl8139_do_receive, rtl8139_set_link_status);
@@ -3387,6 +3513,32 @@ static const device_config_t rtl8139c_config[] = {
     },
     { .name = "", .description = "", .type = CONFIG_END }
 };
+
+static const device_config_t rtl8169_config[] = {
+    {
+        .name           = "mac",
+        .description    = "MAC Address",
+        .type           = CONFIG_MAC,
+        .default_string = NULL,
+        .default_int    = -1,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "bios",
+        .description    = "Boot ROM (" ROM_PATH_RTL8169 ")",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    { .name = "", .description = "", .type = CONFIG_END }
+};
 // clang-format on
 
 const device_t rtl8139c_plus_device = {
@@ -3401,4 +3553,18 @@ const device_t rtl8139c_plus_device = {
     .speed_changed = NULL,
     .force_redraw  = NULL,
     .config        = rtl8139c_config
+};
+
+const device_t rtl8169_device = {
+    .name          = "Realtek RTL8169S",
+    .internal_name = "rtl8169",
+    .flags         = DEVICE_PCI,
+    .local         = 1,
+    .init          = nic_init,
+    .close         = nic_close,
+    .reset         = rtl8139_reset,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = rtl8169_config
 };

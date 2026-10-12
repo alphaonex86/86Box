@@ -246,8 +246,9 @@ extern const device_t modem_device;
 /* PLIP */
 extern const device_t plip_device;
 
-/* Realtek RTL8139C+ */
+/* Realtek RTL8139C+, RTL8169S */
 extern const device_t rtl8139c_plus_device;
+extern const device_t rtl8169_device;
 
 /* DEC Tulip */
 extern const device_t dec_tulip_device;
