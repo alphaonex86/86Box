@@ -176,6 +176,7 @@ int cpu_mem_prefetch_cycles;
 int cpu_rom_prefetch_cycles;
 int cpu_waitstates;
 int cpu_cache_int_enabled;
+void (*cpu_cache_hook)(int event);
 int cpu_cache_ext_enabled;
 int cpu_flush_pending;
 int cpu_old_paging;

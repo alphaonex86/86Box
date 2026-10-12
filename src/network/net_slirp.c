@@ -536,8 +536,8 @@ net_slirp_init(const netcard_t *card, const uint8_t *mac_addr, UNUSED(void *priv
         .vhost6                = { .s6_addr = { 0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02 } }, /* fec0::2 - unused */
         .vhostname             = "86Box",
         .tftp_server_name      = NULL,
-        .tftp_path             = NULL,
-        .bootfile              = NULL,
+        .tftp_path             = getenv("BOX86_SLIRP_TFTP"),
+        .bootfile              = getenv("BOX86_SLIRP_BOOTFILE"),
         .vdhcp_start           = dhcp,
         .vnameserver           = dns,
         .vnameserver6          = { .s6_addr = { 0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x03 } }, /* fec0::3 - unused */

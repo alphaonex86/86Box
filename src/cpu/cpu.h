@@ -644,6 +644,9 @@ extern int cpu_waitstates;
 extern int cpu_flush_pending;
 extern int cpu_old_paging;
 extern int cpu_cache_int_enabled;
+/* Chipset callback for internal cache events (cache-as-RAM emulation), NULL if unused. */
+enum { CPU_CACHE_INVD, CPU_CACHE_WBINVD, CPU_CACHE_CR0 };
+extern void (*cpu_cache_hook)(int event);
 extern int cpu_cache_ext_enabled;
 extern int cpu_isa_speed;
 extern int cpu_pci_speed;

@@ -100,7 +100,9 @@ typedef struct ide_s {
     uint32_t drive;
     uint32_t cfg_spt;
     uint32_t cfg_hpc;
-    uint32_t lba_addr;
+    uint64_t lba_addr;
+    uint8_t  hob[4];          /* LBA48: previous sector count, sector, cylinder low and high */
+    uint32_t ext_left;        /* LBA48: sectors after the current 256-sector segment */
     uint32_t tracks;
     uint32_t spt;
     uint32_t hpc;

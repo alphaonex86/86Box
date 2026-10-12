@@ -14,6 +14,7 @@
  */
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <wchar.h>
@@ -148,6 +149,13 @@ postcard_write(uint16_t port, uint8_t val, UNUSED(void *priv))
 
     postcard_prev_codes[port & POSTCARD_MASK] = postcard_codes[port & POSTCARD_MASK];
     postcard_codes[port & POSTCARD_MASK]      = val;
+
+    const char *log = getenv("BOX86_POSTLOG"); /* firmware tests: every new code, one per line */
+    FILE       *fp;
+    if (log && !(port & POSTCARD_MASK) && (fp = fopen(log, "a"))) {
+        fprintf(fp, "%02X\n", val);
+        fclose(fp);
+    }
     if (postcard_written[port & POSTCARD_MASK] < 2)
         postcard_written[port & POSTCARD_MASK]++;
 

@@ -871,6 +871,8 @@ opCLTS(UNUSED(uint32_t fetchdat))
 static int
 opINVD(UNUSED(uint32_t fetchdat))
 {
+    if (cpu_cache_hook)
+        cpu_cache_hook(CPU_CACHE_INVD);
     CLOCK_CYCLES(1000);
     CPU_BLOCK_END();
     return 0;
@@ -882,6 +884,8 @@ opWBINVD(UNUSED(uint32_t fetchdat))
         x86gpf(NULL, 0);
         return 1;
     }
+    if (cpu_cache_hook)
+        cpu_cache_hook(CPU_CACHE_WBINVD);
     CLOCK_CYCLES(10000);
     CPU_BLOCK_END();
     return 0;

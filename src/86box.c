@@ -1547,6 +1547,8 @@ pc_init_modules(void)
         exit(-1);
     }
 
+    testctl_init();
+
     return 1;
 }
 
@@ -2025,6 +2027,7 @@ pc_run(void)
 #endif
     joystick_process(0); // Gameport 0
     endblit();
+    testctl_poll();
 
     /* Done with this frame, update statistics. */
     framecount++;

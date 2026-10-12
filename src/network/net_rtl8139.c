@@ -45,9 +45,12 @@
 #include <86box/network.h>
 #include <86box/nmc93cxx.h>
 #include <86box/nvr.h>
+#include <86box/rom.h>
 #include "cpu.h"
 #include <86box/plat_unused.h>
 #include <86box/bswap.h>
+
+#define ROM_PATH_RTL8139 "roms/network/rtl8139c/rtl8139c.rom"
 
 #define PCI_PERIOD 30 /* 30 ns period = 33.333333 Mhz frequency */
 
@@ -463,6 +466,9 @@ struct RTL8139State {
     pc_timer_t timer;
 
     mem_mapping_t bar_mem;
+    rom_t         boot_rom;
+    uint32_t      boot_rom_size;
+    uint8_t       rom_bar[4];
 
     /* Support migration to/from old versions */
     int rtl8139_mmio_io_addr_dummy;
@@ -3099,6 +3105,36 @@ rtl8139_timer(void *priv)
     }
 }
 
+/* MMIO BAR: decoded whenever PCI memory space is on, whatever the order of BAR and command writes. */
+static void
+rtl8139_mem_update(RTL8139State *s)
+{
+#ifdef USE_256_BYTE_BAR
+    const uint32_t size = 256;
+#else
+    const uint32_t size = 4096;
+#endif
+
+    if ((s->pci_conf[0x04] & PCI_COMMAND_MEM) && s->mem_base)
+        mem_mapping_set_addr(&s->bar_mem, s->mem_base, size);
+    else
+        mem_mapping_disable(&s->bar_mem);
+}
+
+static void
+rtl8139_rom_update(RTL8139State *s)
+{
+    uint32_t bar = s->rom_bar[0] | (s->rom_bar[1] << 8) | (s->rom_bar[2] << 16) | ((uint32_t) s->rom_bar[3] << 24);
+
+    bar &= ~(s->boot_rom_size - 1) | 1;
+    for (int i = 0; i < 4; i++)
+        s->rom_bar[i] = bar >> (8 * i);
+    if ((bar & 1) && (s->pci_conf[0x04] & PCI_COMMAND_MEM))
+        mem_mapping_set_addr(&s->boot_rom.mapping, bar & ~1u, s->boot_rom_size);
+    else
+        mem_mapping_disable(&s->boot_rom.mapping);
+}
+
 static uint8_t
 rtl8139_pci_read(UNUSED(int func), int addr, UNUSED(int len), void *priv)
 {
@@ -3149,6 +3185,8 @@ rtl8139_pci_read(UNUSED(int func), int addr, UNUSED(int len), void *priv)
             return 0x39;
         case 0x2f:
             return 0x81;
+        case 0x30 ... 0x33:
+            return s->rom_bar[addr & 3];
         case 0x34:
             return 0xdc;
         case 0x3d:
@@ -3163,7 +3201,6 @@ rtl8139_pci_write(UNUSED(int func), int addr, UNUSED(int len), uint8_t val, void
 
     switch (addr) {
         case 0x04:
-            mem_mapping_disable(&s->bar_mem);
             io_removehandler((s->pci_conf[0x11] << 8), 256,
                              rtl8139_io_readb_ioport, rtl8139_io_readw_ioport, rtl8139_io_readl_ioport,
                              rtl8139_io_writeb_ioport, rtl8139_io_writew_ioport, rtl8139_io_writel_ioport,
@@ -3174,8 +3211,9 @@ rtl8139_pci_write(UNUSED(int func), int addr, UNUSED(int len), uint8_t val, void
                               rtl8139_io_readb_ioport, rtl8139_io_readw_ioport, rtl8139_io_readl_ioport,
                               rtl8139_io_writeb_ioport, rtl8139_io_writew_ioport, rtl8139_io_writel_ioport,
                               priv);
-            if ((val & PCI_COMMAND_MEM) && s->bar_mem.size)
-                mem_mapping_enable(&s->bar_mem);
+            rtl8139_mem_update(s);
+            if (s->boot_rom_size)
+                rtl8139_rom_update(s);
             break;
         case 0x05:
             s->pci_conf[addr & 0xFF] = val & 1;
@@ -3213,14 +3251,13 @@ rtl8139_pci_write(UNUSED(int func), int addr, UNUSED(int len), uint8_t val, void
             s->mem_base &= 0xfffff000;
 #endif
             rtl8139_log("New memory base: %08X\n", s->mem_base);
-            if (s->pci_conf[0x4] & PCI_COMMAND_MEM)
-#ifdef USE_256_BYTE_BAR
-                mem_mapping_set_addr(&s->bar_mem, (s->pci_conf[0x15] << 8) | (s->pci_conf[0x16] << 16) |
-                                     (s->pci_conf[0x17] << 24), 256);
-#else
-                mem_mapping_set_addr(&s->bar_mem, ((s->pci_conf[0x15] & 0xf0) << 8) |
-                                     (s->pci_conf[0x16] << 16) | (s->pci_conf[0x17] << 24), 4096);
-#endif
+            rtl8139_mem_update(s);
+            break;
+        case 0x30 ... 0x33:
+            if (s->boot_rom_size) {
+                s->rom_bar[addr & 3] = val;
+                rtl8139_rom_update(s);
+            }
             break;
         case 0x3c:
             s->pci_conf[addr & 0xFF] = val;
@@ -3292,6 +3329,21 @@ nic_init(const device_t *info)
     snprintf(filename, sizeof(filename), "nmc93cxx_eeprom_%s_%d.nvr", info->internal_name, s->inst);
     s->eeprom = device_add_inst_params(&nmc93cxx_device, s->inst, &params);
 
+    if (device_get_config_int("bios")) {
+        FILE *fp = rom_fopen(ROM_PATH_RTL8139, "rb");
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            long len = ftell(fp);
+            fclose(fp);
+            for (s->boot_rom_size = 0x2000; s->boot_rom_size < len && s->boot_rom_size < 0x20000;)
+                s->boot_rom_size <<= 1;
+            rom_init(&s->boot_rom, ROM_PATH_RTL8139, 0, s->boot_rom_size, s->boot_rom_size - 1, 0,
+                     MEM_MAPPING_EXTERNAL);
+            mem_mapping_disable(&s->boot_rom.mapping);
+        } else
+            pclog("RTL8139: boot ROM %s not found\n", ROM_PATH_RTL8139);
+    }
+
     s->nic = network_attach(s, (uint8_t *) &s->phys[MAC0], rtl8139_do_receive, rtl8139_set_link_status);
     timer_add(&s->timer, rtl8139_timer, s, 0);
     timer_on_auto(&s->timer, 1000000.0 / cpu_pci_speed);
@@ -3317,6 +3369,17 @@ static const device_config_t rtl8139c_config[] = {
         .type           = CONFIG_MAC,
         .default_string = NULL,
         .default_int    = -1,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "bios",
+        .description    = "Boot ROM (" ROM_PATH_RTL8139 ")",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 0,
         .file_filter    = NULL,
         .spinner        = { 0 },
         .selection      = { { 0 } },

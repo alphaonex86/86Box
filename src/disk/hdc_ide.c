@@ -74,6 +74,9 @@
 #define WIN_RECAL                      0x10
 #define WIN_READ                       0x20 /* 28-Bit Read */
 #define WIN_READ_NORETRY               0x21 /* 28-Bit Read - no retry */
+#define WIN_READ_EXT                   0x24 /* 48-Bit Read */
+#define WIN_WRITE_EXT                  0x34 /* 48-Bit Write */
+#define WIN_VERIFY_EXT                 0x42 /* 48-Bit Verify */
 #define WIN_WRITE                      0x30 /* 28-Bit Write */
 #define WIN_WRITE_NORETRY              0x31 /* 28-Bit Write - no retry */
 #define WIN_VERIFY                     0x40 /* 28-Bit Verify */
@@ -621,6 +624,16 @@ ide_hd_identify(const ide_t *ide)
     ide->buffer[83] = ide->buffer[84] = 0x4000;
     ide->buffer[86] = 0x0000;
     ide->buffer[87] = 0x4000;
+
+    uint64_t total = (uint64_t) hdd[ide->hdd_num].tracks * hdd[ide->hdd_num].hpc * hdd[ide->hdd_num].spt;
+    if (total > 0x0fffffff) {
+        ide->buffer[83] |= 1 << 10;   /* 48-bit address feature set supported */
+        ide->buffer[86] |= 1 << 10;   /* and enabled */
+        for (int i = 0; i < 4; i++)
+            ide->buffer[100 + i] = (total >> (16 * i)) & 0xffff;
+        ide->buffer[60] = 0xffff;
+        ide->buffer[61] = 0x0fff;
+    }
 }
 
 static void
@@ -784,6 +797,36 @@ ide_get_sector_format(ide_t *ide)
 
         return ((((off64_t) ide->tf->cylinder * heads) + (off64_t) ide->tf->head) * sectors);
     }
+}
+
+/* LBA48 commands run as their 28-bit form, 256 sectors at a time. */
+static void
+ide_ext_start(ide_t *ide, uint8_t *cmd)
+{
+    if ((ide->type != IDE_HDD) ||
+        ((*cmd != WIN_READ_EXT) && (*cmd != WIN_WRITE_EXT) && (*cmd != WIN_VERIFY_EXT)))
+        return;
+    uint32_t count = (ide->hob[0] << 8) | ide->tf->secount;
+    if (!count)
+        count = 65536;
+    ide->lba_addr = ((uint64_t) ide->hob[3] << 40) | ((uint64_t) ide->hob[2] << 32) |
+                    ((uint64_t) ide->hob[1] << 24) | ((uint64_t) ide->tf->cylinder << 8) | ide->tf->sector;
+    ide->tf->lba     = 1;
+    ide->tf->secount = (count > 256 ? 256 : count) & 0xff;
+    ide->ext_left    = count > 256 ? count - 256 : 0;
+    *cmd = (*cmd == WIN_READ_EXT) ? WIN_READ : (*cmd == WIN_WRITE_EXT) ? WIN_WRITE : WIN_VERIFY;
+}
+
+/* End of a segment: start the next one of an LBA48 command; returns 1 if there is one. */
+static int
+ide_ext_next(ide_t *ide)
+{
+    if (!ide->ext_left)
+        return 0;
+    uint32_t seg     = ide->ext_left > 256 ? 256 : ide->ext_left;
+    ide->ext_left   -= seg;
+    ide->tf->secount = seg & 0xff;
+    return 1;
 }
 
 /**
@@ -1697,18 +1740,25 @@ ide_writeb(uint16_t addr, uint8_t val, void *priv)
 
         case 0x2: /* Sector count */
             if (!(ide->tf->atastat & (BSY_STAT | DRQ_STAT)))
+            {
+                ide->hob[0]            = ide->tf->secount;
                 ide->tf->secount       = val;
-            if (!(ide_other->tf->atastat & (BSY_STAT | DRQ_STAT)))
+            }
+            if (!(ide_other->tf->atastat & (BSY_STAT | DRQ_STAT))) {
+                ide_other->hob[0]      = ide_other->tf->secount;
                 ide_other->tf->secount = val;
+            }
             break;
 
         case 0x3: /* Sector */
             if (!(ide->tf->atastat & (BSY_STAT | DRQ_STAT))) {
+                ide->hob[1]            = ide->tf->sector;
                 ide->tf->sector        = val;
                 ide->lba_addr          = (ide->lba_addr & 0xfffff00) | val;
             }
 
             if (!(ide_other->tf->atastat & (BSY_STAT | DRQ_STAT))) {
+                ide_other->hob[1]      = ide_other->tf->sector;
                 ide_other->tf->sector  = val;
                 ide_other->lba_addr    = (ide_other->lba_addr & 0xfffff00) | val;
             }
@@ -1716,11 +1766,13 @@ ide_writeb(uint16_t addr, uint8_t val, void *priv)
 
         case 0x4: /* Cylinder low */
             if (!(ide->type & IDE_SHADOW) && !(ide->tf->atastat & (BSY_STAT | DRQ_STAT))) {
+                ide->hob[2]       = ide->tf->cylinder & 0xff;
                 ide->tf->cylinder = (ide->tf->cylinder & 0xff00) | val;
                 ide->lba_addr     = (ide->lba_addr & 0xfff00ff) | (val << 8);
             }
 
             if (!(ide_other->type & IDE_SHADOW) && !(ide_other->tf->atastat & (BSY_STAT | DRQ_STAT))) {
+                ide_other->hob[2]       = ide_other->tf->cylinder & 0xff;
                 ide_other->tf->cylinder = (ide_other->tf->cylinder & 0xff00) | val;
                 ide_other->lba_addr     = (ide_other->lba_addr & 0xfff00ff) | (val << 8);
             }
@@ -1728,11 +1780,13 @@ ide_writeb(uint16_t addr, uint8_t val, void *priv)
 
         case 0x5: /* Cylinder high */
             if (!(ide->type & IDE_SHADOW) && !(ide->tf->atastat & (BSY_STAT | DRQ_STAT))) {
+                ide->hob[3]       = ide->tf->cylinder >> 8;
                 ide->tf->cylinder = (ide->tf->cylinder & 0xff) | (val << 8);
                 ide->lba_addr     = (ide->lba_addr & 0xf00ffff) | (val << 16);
             }
 
             if (!(ide_other->type & IDE_SHADOW) && !(ide_other->tf->atastat & (BSY_STAT | DRQ_STAT))) {
+                ide_other->hob[3]       = ide_other->tf->cylinder >> 8;
                 ide_other->tf->cylinder = (ide_other->tf->cylinder & 0xff) | (val << 8);
                 ide_other->lba_addr     = (ide_other->lba_addr & 0xf00ffff) | (val << 16);
             }
@@ -1789,6 +1843,7 @@ ide_writeb(uint16_t addr, uint8_t val, void *priv)
                 break;
 
             ide_irq_lower(ide);
+            ide_ext_start(ide, &val);
             ide->command = val;
 
             ide->tf->error = 0;
@@ -2055,6 +2110,8 @@ ide_read_data(ide_t *ide)
                 (ide->command == WIN_READ_MULTIPLE)) {
 
                 ide->tf->secount--;
+                if (!ide->tf->secount && ide_ext_next(ide))
+                    ide->do_initial_read = 1;
 
                 if (ide->tf->secount) {
                     ide_next_sector(ide);
@@ -2566,6 +2623,7 @@ ide_callback(void *priv)
                 ret = hdd_image_write(ide->hdd_num, ide_get_sector(ide), 1, (uint8_t *) ide->buffer);
                 ide_irq_raise(ide);
                 ide->tf->secount--;
+                ide_ext_next(ide);
                 if (ide->tf->secount) {
                     ide->tf->atastat = DRQ_STAT | DRDY_STAT | DSC_STAT;
                     ide->tf->pos     = 0;
