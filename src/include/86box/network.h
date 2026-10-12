@@ -259,8 +259,9 @@ extern const device_t modem_device;
 extern const device_t pe3_device;
 extern const device_t plip_device;
 
-/* Realtek RTL8139C+ */
+/* Realtek RTL8139C+, RTL8169S */
 extern const device_t rtl8139c_plus_device;
+extern const device_t rtl8169_device;
 
 /* Intel 8255x */
 extern const device_t i82557_device;

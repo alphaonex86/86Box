@@ -138,6 +138,7 @@ static const NETWORK_CARD net_cards[] = {
     { &nec_pk_ug_x006_device      },
     { &rtl8029as_device           },
     { &rtl8139c_plus_device       },
+    { &rtl8169_device             },
     { &smc_epic100_device         },
     { NULL                        }
     // clang-format on
