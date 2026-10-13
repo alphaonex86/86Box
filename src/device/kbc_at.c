@@ -132,6 +132,9 @@ typedef struct atkbc_t {
     pc_timer_t kbc_poll_timer;
     pc_timer_t kbc_dev_poll_timer;
 
+    /* Keyboard still in its power-on self test (BOX86_KBD_POWERON_MS): bytes sent to it time out. */
+    int kbd_powering;
+
     /* P2 pulse callback timer. */
     pc_timer_t pulse_cb;
 
@@ -446,7 +449,7 @@ kbc_ibf_process(atkbc_t *dev)
         kbc_at_process_cmd(dev);
     else {
         set_enable_kbd(dev, 1);
-        if ((dev->ports[0] != NULL) && (dev->ports[0]->priv != NULL)) {
+        if ((dev->ports[0] != NULL) && (dev->ports[0]->priv != NULL) && !dev->kbd_powering) {
             dev->ports[0]->wantcmd = 1;
             dev->ports[0]->dat = dev->ib;
             dev->state         = STATE_SEND_KBD;
@@ -736,6 +739,7 @@ kbc_at_dev_poll(void *priv)
     atkbc_t *dev = (atkbc_t *) priv;
 
     timer_advance_u64(&dev->kbc_dev_poll_timer, (100ULL * TIMER_USEC));
+    dev->kbd_powering = 0;
 
     if ((kbc_at_ports[0] != NULL) && (kbc_at_ports[0]->priv != NULL))
         kbc_at_ports[0]->poll(kbc_at_ports[0]->priv);
@@ -2909,6 +2913,16 @@ kbc_at_init(const device_t *info)
     timer_add(&dev->pulse_cb, pulse_poll, dev, 0);
 
     timer_add(&dev->kbc_dev_poll_timer, kbc_at_dev_poll, dev, 1);
+
+    /* Power-on time of a real 8042 (firmware start) and keyboard (self test, AAh), for firmware tests: the
+       controller does not run, the keyboard neither answers nor sends until then. */
+    const char *kbc_ms = getenv("BOX86_KBC_POWERON_MS"), *kbd_ms = getenv("BOX86_KBD_POWERON_MS");
+    if (kbc_ms && atoi(kbc_ms) > 0)             /* microseconds as a double: 64-bit timer units overflow */
+        timer_on_auto(&dev->kbc_poll_timer, atoi(kbc_ms) * 1000.0);
+    if (kbd_ms && atoi(kbd_ms) > 0) {
+        dev->kbd_powering = 1;
+        timer_on_auto(&dev->kbc_dev_poll_timer, atoi(kbd_ms) * 1000.0);
+    }
 
     dev->write_cmd_data_ven = NULL;
     dev->write_cmd_ven      = NULL;

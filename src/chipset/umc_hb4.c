@@ -172,6 +172,11 @@ typedef struct hb4_t {
     uint32_t      l2_size; /* 0: none installed */
     int           l2_banks;
     uint8_t      *l2_data;
+    uint8_t      *l2_tag;     /* per 16-byte line: tag, bit 7 = dirty with 7-bit tags (51h bit 0 clear) */
+    uint8_t      *l2_bad;     /* line not equal to DRAM: never filled, or DRAM/SRAM changed behind it */
+    int           l2_touched; /* 50h/5Ah written since the last settle check */
+    int           l2_settled; /* no bad line and L2 on: transparent for the CPU, the fast RAM path is back */
+    pc_timer_t    l2_timer;
     uint8_t       regs[3];      /* 52h, 53h, 61h */
     int           flat;         /* one-to-one decode: data in 86Box RAM below flat_top, laid out by flat_regs */
     int           overlay;      /* hb4_ram_* handlers in front of the RAM (cache-as-RAM, forced L2 hit) */
@@ -447,39 +452,170 @@ hb4_l2_byte(hb4_t *dev, uint32_t addr)
     return size ? &dev->l2_data[addr & (size - 1)] : NULL;
 }
 
-/* Behind the internal cache: L2 SRAM (forced hit), flat RAM or SIMM cells; unanswered reads float high. */
+/* DRAM behind the caches: flat RAM or SIMM cells; unanswered reads float high. */
+static uint8_t
+hb4_dram_load(hb4_t *dev, uint32_t addr)
+{
+    if (dev->flat)
+        return (addr < dev->flat_top) ? ram[addr] : 0xff;
+    int64_t offset = hb4_dram_decode(dev, dev->regs, addr);
+    return (offset < 0) ? 0xff : dev->simm_data[offset];
+}
+
+static void
+hb4_dram_store(hb4_t *dev, uint32_t addr, uint8_t val)
+{
+    if (dev->flat) {
+        if (addr < dev->flat_top)
+            mem_write_ramb_page(addr, val, &pages[addr >> 12]); /* tracks code pages */
+        return;
+    }
+    int64_t offset = hb4_dram_decode(dev, dev->regs, addr);
+    if (offset >= 0)
+        dev->simm_data[offset] = val;
+}
+
+/*
+   L2 normal mode (fork), modelled while some line differs from DRAM (power-on contents, DRAM written with
+   the L2 off, forced-hit writes); with none and the L2 on it is transparent and the fast RAM path returns. Direct mapped, 16-byte lines, no valid bit; tags, dirty bits and data
+   are random at power-on. Hypothesis fitted to the real board (an L2 with its size set and bit 7 clear
+   crashed it once write-back was set; the original BIOS fills twice, off then on): with a size programmed
+   the L2 fills lines on read misses even while 50h bit 7 is clear, but serves hits only with bit 7 set;
+   in write-back (bit 6) a miss first writes a dirty line back, in write-through a fill keeps the dirty bit.
+*/
+static uint32_t
+hb4_l2_prog(const hb4_t *dev)
+{
+    uint8_t r50 = dev->pci_conf[0x50];
+    return (dev->l2_size && (r50 & 7)) ? MIN(dev->l2_size, 0x8000u << (r50 & 7)) : 0;
+}
+
+static int
+hb4_l2_active(const hb4_t *dev)
+{
+    return !dev->l2_settled && hb4_l2_prog(dev) && !hb4_l2_forced(dev);
+}
+
+static uint8_t *
+hb4_l2_slot(hb4_t *dev, uint32_t addr, uint32_t *line)
+{
+    uint32_t prog = hb4_l2_prog(dev), mask = (dev->pci_conf[0x51] & 1) ? 0xff : 0x7f;
+    uint32_t top  = dev->flat ? dev->flat_top : 0x10000000u;
+    if (!prog || (addr >= MIN((uint64_t) prog * (mask + 1), top)))
+        return NULL;
+    uint8_t *byte = hb4_l2_byte(dev, addr & ~15u);
+    if (!byte)
+        return NULL;
+    *line = (byte - dev->l2_data) >> 4;
+    return byte;
+}
+
+static void hb4_ram_update(hb4_t *dev);
+
+/* Back to modelling after a transparent period: the L2 then held what DRAM holds, line by line. */
+static void
+hb4_l2_resume(hb4_t *dev)
+{
+    uint32_t prog = hb4_l2_prog(dev);
+    uint8_t  mask = (dev->pci_conf[0x51] & 1) ? 0xff : 0x7f;
+
+    for (uint32_t line = 0; prog && (line < prog / 16); line++) {
+        for (int i = 0; i < 16; i++)
+            dev->l2_data[line * 16 + i] = hb4_dram_load(dev, (dev->l2_tag[line] & mask) * prog + line * 16 + i);
+        dev->l2_tag[line] &= mask;
+    }
+    dev->l2_settled = 0;
+}
+
+/* Every 0.5 s while modelled: once every line equals DRAM with the L2 on and its registers untouched
+   since the last check (POST done), the L2 is transparent and is left to the fast RAM path (DRAM is
+   kept current, see hb4_l2_store). Not with CR0.CD set (L1 off: a firmware L2 init in progress, which
+   reads lines, then changes DRAM behind the L2: the reads must still load tags). */
+static void
+hb4_l2_settle(void *priv)
+{
+    hb4_t   *dev  = (hb4_t *) priv;
+    uint32_t prog = hb4_l2_prog(dev);
+    int      bad  = !(dev->pci_conf[0x50] & 0x80) || !prog || hb4_l2_forced(dev) || (cr0 & (1u << 30));
+
+    for (uint32_t line = 0; !bad && (line < prog / 16); line++)
+        bad = dev->l2_bad[line];
+    if (bad || dev->l2_touched) {
+        dev->l2_touched = 0;
+        if (hb4_l2_active(dev))
+            timer_on_auto(&dev->l2_timer, 500000.0);
+        return;
+    }
+    dev->l2_settled = 1;
+    hb4_ram_update(dev);
+}
+
+static uint8_t
+hb4_l2_load(hb4_t *dev, uint32_t addr)
+{
+    uint32_t line, prog = hb4_l2_prog(dev);
+    uint8_t *data = hb4_l2_slot(dev, addr, &line), r50 = dev->pci_conf[0x50];
+    uint8_t  mask = (dev->pci_conf[0x51] & 1) ? 0xff : 0x7f, tag = (addr / prog) & mask;
+    uint32_t base = addr & (prog - 1) & ~15u;
+
+    if (!data)
+        return hb4_dram_load(dev, addr);
+    if ((r50 & 0x80) && ((dev->l2_tag[line] & mask) == tag))
+        return data[addr & 15];
+    if ((r50 & 0x40) && ((mask == 0xff) || (dev->l2_tag[line] & 0x80)))
+        for (int i = 0; i < 16; i++)
+            hb4_dram_store(dev, (dev->l2_tag[line] & mask) * prog + base + i, data[i]);
+    for (int i = 0; i < 16; i++)
+        data[i] = hb4_dram_load(dev, (addr & ~15u) + i);
+    dev->l2_tag[line] = tag | ((r50 & 0x40) ? 0 : (dev->l2_tag[line] & 0x80 & ~mask));
+    dev->l2_bad[line] = 0;
+    return data[addr & 15];
+}
+
+static void
+hb4_l2_store(hb4_t *dev, uint32_t addr, uint8_t val)
+{
+    uint32_t line, prog = hb4_l2_prog(dev);
+    uint8_t *data = hb4_l2_slot(dev, addr, &line), r50 = dev->pci_conf[0x50];
+    uint8_t  mask = (dev->pci_conf[0x51] & 1) ? 0xff : 0x7f;
+
+    int hit = data && ((dev->l2_tag[line] & mask) == ((addr / prog) & mask));
+    if (hit && !(r50 & 0x80))
+        dev->l2_bad[line] = 1;        /* DRAM changes behind the line */
+    if (hit && (r50 & 0x80)) {
+        data[addr & 15] = val;
+        if ((r50 & 0x40) && (mask != 0xff))
+            dev->l2_tag[line] |= 0x80;
+    }
+    /* also in write-back: code is fetched from DRAM directly (exec pointer), and a later write-back of
+       this line writes the same bytes; random power-on dirty lines still write garbage back */
+    hb4_dram_store(dev, addr, val);
+}
+
+/* Behind the internal cache: L2 SRAM (forced hit), the L2 model or DRAM. */
 static uint8_t
 hb4_load(hb4_t *dev, uint32_t addr)
 {
-    uint8_t *byte = NULL;
-
-    if (hb4_l2_forced(dev))
-        byte = hb4_l2_byte(dev, addr);
-    else if (dev->flat)
-        byte = (addr < dev->flat_top) ? &ram[addr] : NULL;
-    else {
-        int64_t offset = hb4_dram_decode(dev, dev->regs, addr);
-        byte           = (offset < 0) ? NULL : &dev->simm_data[offset];
+    if (hb4_l2_forced(dev)) {
+        uint8_t *byte = hb4_l2_byte(dev, addr);
+        return byte ? *byte : 0xff;
     }
-    return byte ? *byte : 0xff;
+    return hb4_l2_active(dev) ? hb4_l2_load(dev, addr) : hb4_dram_load(dev, addr);
 }
 
 static void
 hb4_store(hb4_t *dev, uint32_t addr, uint8_t val)
 {
-    uint8_t *byte = NULL;
-
-    if (hb4_l2_forced(dev))
-        byte = hb4_l2_byte(dev, addr);
-    else if (dev->flat) {
-        if (addr < dev->flat_top)
-            mem_write_ramb_page(addr, val, &pages[addr >> 12]); /* tracks code pages */
-    } else {
-        int64_t offset = hb4_dram_decode(dev, dev->regs, addr);
-        byte           = (offset < 0) ? NULL : &dev->simm_data[offset];
-    }
-    if (byte)
-        *byte = val;
+    if (hb4_l2_forced(dev)) {
+        uint8_t *byte = hb4_l2_byte(dev, addr);
+        if (byte) {
+            *byte = val;
+            dev->l2_bad[(byte - dev->l2_data) >> 4] = 1;
+        }
+    } else if (hb4_l2_active(dev))
+        hb4_l2_store(dev, addr, val);
+    else
+        hb4_dram_store(dev, addr, val);
 }
 
 static uint8_t *
@@ -595,7 +731,7 @@ hb4_ram_update(hb4_t *dev)
     uint32_t top     = hb4_region(regs, 0).size + hb4_region(regs, 1).size;
     int      flat    = (top >= 0x100000) && (top <= mem_size * 1024) && hb4_region_flat(dev, regs, 0) &&
                        hb4_region_flat(dev, regs, 1);
-    int      overlay = dev->l1_track || dev->l1_car || hb4_l2_forced(dev);
+    int      overlay = dev->l1_track || dev->l1_car || hb4_l2_forced(dev) || hb4_l2_active(dev);
 
     if ((flat != dev->flat) || (flat && memcmp(regs, dev->flat_regs, 3))) {
         if (dev->flat)
@@ -618,7 +754,7 @@ hb4_ram_update(hb4_t *dev)
         mem_mapping_disable(&dev->high_mapping);
         mem_mapping_set_addr(&ram_high_mapping, 0x100000, top - 0x100000);
     } else {
-        mem_mapping_set_exec(&dev->low_mapping, flat ? ram : NULL);
+        mem_mapping_set_exec(&dev->low_mapping, flat ? ram : NULL);   /* code fetches bypass the L2 model */
         mem_mapping_enable(&dev->low_mapping);
         mem_mapping_set_addr(&dev->high_mapping, 0x100000, (flat ? top : 0x10000000) - 0x100000);
         mem_mapping_set_exec(&dev->high_mapping, flat ? (ram + 0x100000) : NULL);
@@ -651,6 +787,10 @@ hb4_cache_event(int event)
 {
     hb4_t *dev = hb4_model;
     int    car = (cr0 & 0x60000000) == 0x60000000;
+
+    /* on the real chip a flush also empties the L2: logged so tests can count them (slow POST) */
+    if ((event == CPU_CACHE_WBINVD) && (dev->pci_conf[0x50] & 0x80) && hb4_l2_prog(dev))
+        fprintf(stderr, "UMC HB4: WBINVD with the L2 on\n");
 
     if (event != CPU_CACHE_CR0) {
         memset(dev->l1_tag, 0, sizeof(dev->l1_tag));
@@ -708,6 +848,11 @@ hb4_write(UNUSED(int func), int addr, UNUSED(int len), uint8_t val, void *priv)
             break;
 
         case 0x50:
+            if (dev->model && dev->l2_settled && (((val & 0x87) != (dev->pci_conf[0x50] & 0x87)) || !(val & 0x80)))
+                hb4_l2_resume(dev);
+            dev->l2_touched = 1;
+            if (dev->model && !dev->l2_settled)
+                timer_on_auto(&dev->l2_timer, 500000.0);
             dev->pci_conf[addr]   = dev->model ? val : ((val & 0xf8) | 4); /* Hardcode Cache Size to 512KB */
             cpu_cache_ext_enabled = !!(val & 0x80);     /* Fixes freezing issues on the HOT-433A*/
             cpu_update_waitstates();
@@ -736,6 +881,11 @@ hb4_write(UNUSED(int func), int addr, UNUSED(int len), uint8_t val, void *priv)
             break;
 
         case 0x5a:
+            if (dev->model && dev->l2_settled && (val & 0x40))
+                hb4_l2_resume(dev);
+            dev->l2_touched = 1;
+            if (dev->model && !dev->l2_settled)
+                timer_on_auto(&dev->l2_timer, 500000.0);
             dev->pci_conf[addr] = val;
             if (dev->model)
                 hb4_ram_update(dev);
@@ -851,8 +1001,9 @@ hb4_init(UNUSED(const device_t *info))
 
     pci_add_card(PCI_ADD_NORTHBRIDGE, hb4_read, hb4_write, dev, &dev->pci_slot); /* Device 10: UMC 8881x */
 
-    /* Port 92 */
-    device_add(&port_92_pci_device);
+    /* Port 92: A20 only. On the real MB-8433UUD-A bit 0 does not reset (Ctrl+Alt+Del hung with a BIOS that
+       only used it; the original BIOS resets through the keyboard controller). */
+    port_92_set_features(device_add(&port_92_pci_device), 0, 1);
 
     /* SMRAM */
     dev->smram = smram_add();
@@ -875,8 +1026,10 @@ hb4_init(UNUSED(const device_t *info))
         dev->l2_size   = device_get_config_int("l2_cache") << 10;
         dev->l2_banks  = device_get_config_int("l2_banks");
         dev->simm_data = calloc(1, capacity);
-        dev->l2_data   = calloc(1, 1 << 20);
-        if (!dev->simm_data || !dev->l2_data)
+        dev->l2_data   = malloc(1 << 20);
+        dev->l2_tag    = malloc(1 << 16);
+        dev->l2_bad    = malloc(1 << 16);
+        if (!dev->simm_data || !dev->l2_data || !dev->l2_tag || !dev->l2_bad)
             fatal("UMC HB4: out of memory for %u MB of SIMMs\n", capacity >> 20);
         mem_mapping_add(&dev->low_mapping, 0, 0xa0000, hb4_ram_readb, hb4_ram_readw, hb4_ram_readl,
                         hb4_ram_writeb, hb4_ram_writew, hb4_ram_writel, NULL, 0, dev);
@@ -890,7 +1043,18 @@ hb4_init(UNUSED(const device_t *info))
             mem_mapping_add(&dev->stuck_mapping, dev->stuck_addr & ~0xfff, 0x1000, hb4_stuck_readb,
                             hb4_stuck_readw, hb4_stuck_readl, hb4_ram_writeb, hb4_ram_writew, hb4_ram_writel,
                             NULL, 0, dev);
+        /* power-on SRAM contents: random, reproducible with BOX86_L2_SEED */
+        const char *seed = getenv("BOX86_L2_SEED");
+        uint64_t    x    = seed ? strtoull(seed, NULL, 0) : 1;
+        for (uint32_t i = 0; i < (1 << 20); i++) {
+            x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+            dev->l2_data[i] = x >> 56;
+            if (i < (1 << 16))
+                dev->l2_tag[i] = x >> 48;
+        }
+        memset(dev->l2_bad, 1, 1 << 16);
         timer_add(&dev->l1_timer, hb4_l1_timeout, dev, 0);
+        timer_add(&dev->l2_timer, hb4_l2_settle, dev, 0);
         hb4_model      = dev;
         cpu_cache_hook = hb4_cache_event;
     }

@@ -633,6 +633,12 @@ addwritelookup(uint32_t virt, uint32_t phys)
     cycles -= 9;
 }
 
+/* Firmware tests (testctl "flash"): instructions fetched from and bytes read by the CPU from the BIOS flash.
+   Code fetches are counted by the interpreter only (cpu_use_dynarec = 0). */
+int      pccache_flash;
+uint64_t flash_fetch_count;
+uint64_t flash_read_bytes;
+
 uint8_t *
 getpccache(uint32_t a)
 {
@@ -650,7 +656,10 @@ getpccache(uint32_t a)
     }
     a64 &= rammask;
 
+    pccache_flash = 0;
     if (_mem_exec[a64 >> MEM_GRANULARITY_BITS]) {
+        pccache_flash = read_mapping[a64 >> MEM_GRANULARITY_BITS] &&
+                        (read_mapping[a64 >> MEM_GRANULARITY_BITS]->flags & MEM_MAPPING_ROMCS);
         if (is286) {
             if (read_mapping[a64 >> MEM_GRANULARITY_BITS] && (read_mapping[a64 >> MEM_GRANULARITY_BITS]->flags & MEM_MAPPING_ROM_WS))
                 cpu_prefetch_cycles = cpu_rom_prefetch_cycles;

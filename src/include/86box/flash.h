@@ -26,6 +26,8 @@ extern const device_t catalyst_flash_device;
 
 extern const device_t intel_flash_bxt_ami_device;
 extern const device_t intel_flash_bxt_device;
+extern int flash_we_blocked;   /* set by the chipset: flash WE# gated off */
+extern void flash_cd_decode(int bits);   /* UM8886 57h bits 7-6: lower 128 KiB of a 2 Mbit flash at FFFC0000/FFFD0000 */
 extern const device_t intel_flash_bxb_device;
 
 extern const device_t sst_flash_29ee010_device;
@@ -35,6 +37,7 @@ extern const device_t winbond_flash_w29c512_device;
 extern const device_t winbond_flash_w29c010_device;
 extern const device_t winbond_flash_w29c011a_device;
 extern const device_t winbond_flash_w29c020_device;
+extern const device_t winbond_flash_w49f002a_device;
 extern const device_t winbond_flash_w29c040_device;
 
 extern const device_t sst_flash_39sf512_device;

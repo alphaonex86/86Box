@@ -28,6 +28,7 @@
 #include <86box/nvr.h>
 #include <86box/plat.h>
 #include <86box/m_xt_xi8088.h>
+#include <86box/flash.h>
 
 typedef struct sst_t {
     uint8_t manufacturer;
@@ -130,6 +131,7 @@ static char flash_path[1024];
 #define W29C011A    0xc100
 #define W29C020     0x4500
 #define W29C040     0x4600
+#define W49F002A    0x0b00
 
 #define AMD         0x01 /* AMD Manufacturer's ID */
 #define AMD29F010A  0x2000
@@ -165,6 +167,15 @@ sst_sector_erase(sst_t *dev, uint32_t addr)
             memset(&dev->array[0x3a000], 0xff, 8192);
         else if ((base >= 0x3c000) && (base <= 0x3ffff))
             memset(&dev->array[0x3c000], 0xff, 16384);
+    } else if ((dev->manufacturer == WINBOND) && (dev->id == (W49F002A >> 8))) {
+        /* W49F002A/U, top boot: 128K, 96K, two 8K parameter blocks, the 16K boot block */
+        static const uint32_t start[6] = { 0x00000, 0x20000, 0x38000, 0x3a000, 0x3c000, 0x40000 };
+        base = addr & 0x3ffff;
+        for (int i = 0; i < 5; i++)
+            if (base < start[i + 1]) {
+                memset(&dev->array[start[i]], 0xff, start[i + 1] - start[i]);
+                break;
+            }
     } else if ((dev->manufacturer == AMD) && (dev->id == 0x20)) {
         base = addr & biosmask;
 
@@ -360,6 +371,9 @@ sst_write(uint32_t addr, uint8_t val, void *priv)
         addr1 >>= 4;
     }
 
+    if (flash_we_blocked)          /* the chipset gates WE# off (UM8886 IBC47 bit 6) */
+        return;
+
     switch (dev->command_state) {
         case 0:
         case 3:
@@ -406,7 +420,10 @@ sst_write(uint32_t addr, uint8_t val, void *priv)
             if (dev->is_39) {
                 dev->command_state = 0;
 
-                dev->array[addr & dev->mask] = val;
+                if ((dev->manufacturer == WINBOND) && (dev->id == (W49F002A >> 8)))
+                    dev->array[addr & dev->mask] &= val;    /* programming only clears bits */
+                else
+                    dev->array[addr & dev->mask] = val;
                 dev->dirty                   = 1;
             } else {
                 dev->command_state++;
@@ -521,6 +538,31 @@ sst_add_mappings(sst_t *dev)
     }
 }
 
+/* Segments C and D of a 2 Mbit chip (its lower 128 KiB) at FFFC0000-FFFDFFFF: decoded unless a chipset that
+   gates them (UM8886 57h bits 7-6) says otherwise. */
+static sst_t *sst_current;
+static int    sst_cd_bits = 3;
+
+static void
+sst_cd_apply(void)
+{
+    if (!sst_current || (sst_current->size != SIZE_2M))
+        return;
+    for (int i = 0; i < 2; i++) {
+        if (sst_cd_bits & (2 >> i))
+            mem_mapping_enable(&sst_current->mapping_h[i]);
+        else
+            mem_mapping_disable(&sst_current->mapping_h[i]);
+    }
+}
+
+void
+flash_cd_decode(int bits)
+{
+    sst_cd_bits = bits & 3;
+    sst_cd_apply();
+}
+
 static void *
 sst_init(const device_t *info)
 {
@@ -539,8 +581,8 @@ sst_init(const device_t *info)
     dev->id           = (info->local >> 8) & 0xff;
     dev->has_bbp      = (dev->manufacturer == WINBOND) && ((info->local & 0xff00) >= W29C020);
     dev->is_39        = (dev->manufacturer == SST) && ((info->local & 0xff00) >= SST39SF512);
-    if (dev->manufacturer == AMD)
-        dev->is_39    = 1;
+    if ((dev->manufacturer == AMD) || ((dev->manufacturer == WINBOND) && (dev->id == (W49F002A >> 8))))
+        dev->is_39    = 1;   /* JEDEC byte program and sector erase */
 
     dev->size = info->local & 0xffff0000;
     if ((dev->size == 0x20000) && ((machines[machine].init == machine_xt_xi8088_init) && !xi8088_bios_128kb()))
@@ -552,6 +594,8 @@ sst_init(const device_t *info)
     dev->bbp_first_8k = dev->bbp_last_8k = 0xfe;
 
     sst_add_mappings(dev);
+    sst_current = dev;
+    sst_cd_apply();
 
     fp = nvr_fopen(flash_path, "rb");
     if (fp) {
@@ -573,6 +617,8 @@ sst_close(void *priv)
     FILE  *fp;
     sst_t *dev = (sst_t *) priv;
 
+    if (sst_current == dev)
+        sst_current = NULL;
     if (dev->dirty) {
         fp = nvr_fopen(flash_path, "wb");
         if (fp != NULL) {
@@ -648,6 +694,20 @@ const device_t winbond_flash_w29c011a_device = {
     .internal_name = "winbond_flash_w29c011a",
     .flags         = 0,
     .local         = WINBOND | W29C011A | SIZE_1M,
+    .init          = sst_init,
+    .close         = sst_close,
+    .reset         = NULL,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = NULL
+};
+
+const device_t winbond_flash_w49f002a_device = {
+    .name          = "Winbond W49F002A Flash BIOS",
+    .internal_name = "winbond_flash_w49f002a",
+    .flags         = 0,
+    .local         = WINBOND | W49F002A | SIZE_2M,
     .init          = sst_init,
     .close         = sst_close,
     .reset         = NULL,

@@ -3211,6 +3211,23 @@ const cpu_family_t cpu_families[] = {
         .name          = "Am5x86",
         .internal_name = "am5x86",
         .cpus          = (const CPU[]) {
+            { /* 3 x 40 MHz, as the MB-8433UUD-A of the newBIOS project runs it (CLKMUL low) */
+                .name               = "120 (3x40)",
+                .cpu_type           = CPU_ENH_Am486DX,
+                .fpus               = fpus_internal,
+                .rspeed             = 120000000,
+                .multi              = 3.0,
+                .voltage            = 3450,
+                .edx_reset          = 0x4e0,
+                .cpuid_model        = 0x4e0,
+                .cyrix_id           = 0,
+                .cpu_flags          = CPU_SUPPORTS_DYNAREC,
+                .mem_read_cycles    = 18,
+                .mem_write_cycles   = 18,
+                .cache_read_cycles  = 9,
+                .cache_write_cycles = 9,
+                .atclk_div          = 15
+            },
             {
                 .name               = "133 (P75)",
                 .cpu_type           = CPU_ENH_Am486DX,

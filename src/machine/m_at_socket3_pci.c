@@ -15,6 +15,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 #define HAVE_STDARG_H
@@ -42,6 +43,7 @@
 #include <86box/port_92.h>
 #include <86box/video.h>
 #include <86box/flash.h>
+#include <86box/usb_uhci.h>
 #include <86box/scsi_ncr53c8xx.h>
 #include <86box/hwm.h>
 #include <86box/machine.h>
@@ -49,6 +51,29 @@
 #include <86box/sound.h>
 
 /* ALi M1429G */
+/* The board's chip is an Intel P28F001BX-T. BOX86_FLASH: w29c010 (the chip 86Box used before), sst39sf010 (a JEDEC
+   chip newBIOS does not know, as an SST39SF010A put in its place), w49f002a (2 Mbit: a 256 KiB image, its lower
+   half decoded at FFFC0000 by the UM8886, 57h bits 7-6). */
+static const device_t *
+board_flash_device(void)
+{
+    const char *flash = getenv("BOX86_FLASH");
+    if (flash && !strcmp(flash, "w29c010"))
+        return &winbond_flash_w29c010_device;
+    if (flash && !strcmp(flash, "sst39sf010"))
+        return &sst_flash_39sf010_device;
+    if (flash && !strcmp(flash, "w49f002a"))
+        return &winbond_flash_w49f002a_device;
+    return &intel_flash_bxt_device;
+}
+
+static int
+board_flash_2mbit(void)
+{
+    const char *flash = getenv("BOX86_FLASH");
+    return flash && !strcmp(flash, "w49f002a");
+}
+
 int
 machine_at_ms4134_init(const machine_t *model)
 {
@@ -1181,7 +1206,7 @@ machine_at_84xxuuda_init(const machine_t *model)
     int ret;
 
     ret = bios_load_linear("roms/machines/84xxuuda/uud0520s.bin",
-                           0x000e0000, 131072, 0);
+                           board_flash_2mbit() ? 0x000c0000 : 0x000e0000, board_flash_2mbit() ? 262144 : 131072, 0);
 
     if (bios_only || !ret)
         return ret;
@@ -1198,7 +1223,10 @@ machine_at_84xxuuda_init(const machine_t *model)
     device_add(&umc_hb4_device);
     device_add(&umc_8886bf_device);
     device_add_params(&um866x_device, (void *) UM8663BF);
-    device_add(&winbond_flash_w29c010_device);
+    device_add(board_flash_device());
+    /* The operator's VIA USB card, for tests: BOX86_USB, BOX86_USB_KBD (keyboard), BOX86_USB_DISK (image) */
+    if (getenv("BOX86_USB") || getenv("BOX86_USB_KBD") || getenv("BOX86_USB_DISK"))
+        device_add(&usb_uhci_via_device);
 
     return ret;
 }
@@ -1553,7 +1581,7 @@ machine_at_486vipio2_init(const machine_t *model)
 
     device_add_params(machine_get_kbc_device(machine), (void *) model->kbc_params);
 
-    device_add(&winbond_flash_w29c010_device);
+    device_add(board_flash_device());
 
     return ret;
 }

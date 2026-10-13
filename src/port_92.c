@@ -108,7 +108,7 @@ port_92_writeb(uint16_t port, uint8_t val, void *priv)
         mem_a20_recalc();
     }
 
-    if ((~cpu_alt_reset & val) & 1)
+    if (((~cpu_alt_reset & val) & 1) && (dev->flags & PORT_92_RESET))   /* a board may lack the reset */
         timer_set_delay_u64(&dev->pulse_timer, dev->pulse_period);
     else if (!(val & 1))
         timer_disable(&dev->pulse_timer);

@@ -84,12 +84,14 @@
 #include <86box/machine.h>
 #include <86box/pic.h>
 #include <86box/pci.h>
+#include <86box/flash.h>
 #include <86box/plat_unused.h>
 #include <86box/port_92.h>
 #include <86box/chipset.h>
 
 #ifdef ENABLE_UMC_8886_LOG
 int umc_8886_do_log = ENABLE_UMC_8886_LOG;
+
 
 static void
 umc_8886_log(const char *fmt, ...)
@@ -203,7 +205,6 @@ umc_8886_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
                     case 0x40 ... 0x42:
                     case 0x45:
                     case 0x50 ... 0x55:
-                    case 0x57:
                     case 0x70 ... 0x76:
                     case 0x80 ... 0x83:
                     case 0x90 ... 0x92:
@@ -221,13 +222,20 @@ umc_8886_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
                     case 0x46:    /* Bits 3-0 = 0 = IRQ disabled, 1 = IRQ enabled. */
                     case 0x47:    /* Bits 3-0 = 0 = IRQ edge-triggered, 1 = IRQ level-triggered. */
                         /* Bit 6 seems to be the IRQ/SMI# toggle, 1 = IRQ, 0 = SMI#. */
+                        /* Bit 6 = 1 also blocks the flash WE# (the original BIOS clears it to write the ESCD). */
                         dev->pci_conf_sb[func][addr] = val;
+                        flash_we_blocked = !!(val & 0x40);
                         umc_8886_irq_recalc(dev);
                         break;
 
                     case 0x56:
                         dev->pci_conf_sb[func][addr] = val;
                         umc_8886_bus_recalc(dev);
+                        break;
+
+                    case 0x57:    /* Bits 7-6: segments C and D decoded to the flash (its lower half if 2 Mbit). */
+                        dev->pci_conf_sb[func][addr] = val;
+                        flash_cd_decode(val >> 6);
                         break;
 
                     case 0xa2:
@@ -312,6 +320,7 @@ umc_8886_reset(void *priv)
 
     memset(dev->pci_conf_sb[0], 0x00, sizeof(dev->pci_conf_sb[0]));
     memset(dev->pci_conf_sb[1], 0x00, sizeof(dev->pci_conf_sb[1]));
+    flash_cd_decode(0);
 
     dev->pci_conf_sb[0][0x00] = 0x60; /* UMC */
     dev->pci_conf_sb[0][0x01] = 0x10;
@@ -332,6 +341,7 @@ umc_8886_reset(void *priv)
     dev->pci_conf_sb[0][0x45] = 0x00;
     dev->pci_conf_sb[0][0x46] = 0x10;
     dev->pci_conf_sb[0][0x47] = 0x30;
+    flash_we_blocked = 0;
 
     dev->pci_conf_sb[0][0x51] = 0x02;
 
