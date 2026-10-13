@@ -438,10 +438,34 @@ network_queue_clear(netqueue_t *queue)
     queue->tail = queue->head = 0;
 }
 
+/* BOX86_NET_NOISE_MS: a broadcast ARP request every that many ms of emulated time, the background traffic of a
+   real LAN (SLiRP has none): a card a boot ROM left receiving keeps writing frames into RAM by DMA. */
+static void
+network_noise(netcard_t *card)
+{
+    extern double   cpuclock;
+    static int      ms = -1;
+    static uint64_t next[NET_CARD_MAX];
+    uint8_t         arp[60] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x52, 0x54, 0x00, 0x12, 0x34, 0x99, 0x08, 0x06,
+                                0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01, 0x52, 0x54, 0x00, 0x12, 0x34, 0x99,
+                                10, 0, 2, 98, 0, 0, 0, 0, 0, 0, 10, 0, 2, 99 };
+
+    if (ms < 0) {
+        const char *env = getenv("BOX86_NET_NOISE_MS");
+        ms = env ? atoi(env) : 0;
+    }
+    if ((ms <= 0) || (tsc < next[card->card_num]))
+        return;
+    next[card->card_num] = tsc + (uint64_t) (cpuclock / 1000.0 * ms);
+    network_rx_put(card, arp, sizeof(arp));
+}
+
 static void
 network_rx_queue(void *priv)
 {
     netcard_t *card = (netcard_t *) priv;
+
+    network_noise(card);
 
     uint32_t new_link_state = net_cards_conf[card->card_num].link_state;
     if (new_link_state != card->link_state) {

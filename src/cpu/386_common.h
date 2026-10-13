@@ -526,6 +526,7 @@ fastreadl_fetch(uint32_t a)
             pccache2 = t;
             pccache  = a >> 12;
         }
+        flash_fetch_count += pccache_flash;
         return *((uint32_t *) (((uintptr_t) &pccache2[a] & 0x00000000ffffffffULL) | ((uintptr_t) &pccache2[0] & 0xffffffff00000000ULL)));
     }
     val = fastreadw_fetch(a);

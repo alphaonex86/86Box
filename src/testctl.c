@@ -2,12 +2,15 @@
  * Test control for automated firmware tests. When $BOX86_TESTCTL names a FIFO, each line written to
  * it is one command, run in the emulation thread between CPU blocks:
  *   key <hex>...   press and release each key (set 1 scan codes, 0x1xx = E0 prefixed)
+ *   combo <hex>... press the keys together, then release them (e.g. 1d 38 53: Ctrl+Alt+Del)
+ *   usbkey <hex>.. type on the USB keyboard: modifiers << 8 | HID usage each (e.g. 4c: Del, 054c: Ctrl+Alt+Del)
  *   text <file>    write the 80x25 text screen at B8000 to <file> (atomic rename)
  *   pci <file>     write the config space of every bus 0 PCI function to <file> (atomic rename)
  *   out <port> <v> write byte <v> to I/O <port> (hex)
  *   in <port> <f>  append "<port> <value>" (hex) read from I/O <port> to file <f>
  *   shot           save a PNG of the screen in <vm path>/screenshots/ at the next frame
  *   cr0 <file>     append CR0 (hex) to <file>
+ *   flash <file>   append "<instructions fetched> <bytes read>" from the BIOS flash since the last flash command
  *   reset          hard reset (reset button)
  *   quit           power off (NVR saved)
  */
@@ -22,6 +25,8 @@
 #include <86box/plat.h>
 #include <86box/thread.h>
 #include <86box/video.h>
+#include <86box/device.h>
+#include <86box/usb_uhci.h>
 #include "cpu.h"
 
 #define CMD_MAX 1024
@@ -151,6 +156,22 @@ testctl_poll(void)
             keyboard_input(0, scan);
             arg = end;
         }
+    } else if (!strcmp(cmd, "combo")) {
+        unsigned long keys[8];
+        int n = 0;
+        char *end;
+        for (unsigned long scan = strtoul(arg, &end, 16); end != arg && n < 8; scan = strtoul(arg, &end, 16)) {
+            keyboard_input(1, keys[n++] = scan);
+            arg = end;
+        }
+        while (n > 0)
+            keyboard_input(0, keys[--n]);
+    } else if (!strcmp(cmd, "usbkey")) {
+        char *end;
+        for (unsigned long key = strtoul(arg, &end, 16); end != arg; key = strtoul(arg, &end, 16)) {
+            usb_uhci_key(key);
+            arg = end;
+        }
     } else if (!strcmp(cmd, "text"))
         text_dump(arg);
     else if (!strcmp(cmd, "pci"))
@@ -174,6 +195,13 @@ testctl_poll(void)
             fprintf(fp, "%08x\n", cr0);
             fclose(fp);
         }
+    } else if (!strcmp(cmd, "flash")) {
+        FILE *fp = fopen(arg, "a");
+        if (fp) {
+            fprintf(fp, "%llu %llu\n", (unsigned long long) flash_fetch_count, (unsigned long long) flash_read_bytes);
+            fclose(fp);
+        }
+        flash_fetch_count = flash_read_bytes = 0;
     } else if (!strcmp(cmd, "shot"))
         ++monitors[0].mon_screenshots_raw;
     else if (!strcmp(cmd, "reset"))

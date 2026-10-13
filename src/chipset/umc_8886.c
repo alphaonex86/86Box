@@ -84,6 +84,8 @@
 #include <86box/machine.h>
 #include <86box/pic.h>
 #include <86box/pci.h>
+#include <86box/mem.h>
+#include <86box/flash.h>
 #include <86box/plat_unused.h>
 #include <86box/port_92.h>
 #include <86box/chipset.h>
@@ -203,7 +205,6 @@ umc_8886_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
                     case 0x40 ... 0x42:
                     case 0x45:
                     case 0x50 ... 0x55:
-                    case 0x57:
                     case 0x70 ... 0x76:
                     case 0x80 ... 0x83:
                     case 0x90 ... 0x92:
@@ -228,6 +229,11 @@ umc_8886_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
                     case 0x56:
                         dev->pci_conf_sb[func][addr] = val;
                         umc_8886_bus_recalc(dev);
+                        break;
+
+                    case 0x57:    /* Bits 7-6: segments C and D decoded to the flash (its lower half if 2 Mbit). */
+                        dev->pci_conf_sb[func][addr] = val;
+                        flash_bios_decode_changed();
                         break;
 
                     case 0xa2:
@@ -291,6 +297,27 @@ umc_8886_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
             default:
                 break;
         }
+}
+
+/* The flash chip select: 57h bits 7-6 decode FFFC0000-FFFCFFFF and FFFD0000-FFFDFFFF (the lower half of a
+   2 Mbit flash), 47h bit 6 = 1 keeps WE# off (the original BIOS clears it to write the ESCD). */
+static int
+umc_8886_bios_read_gate(uint32_t addr, void *priv)
+{
+    const umc_8886_t *dev = (umc_8886_t *) priv;
+
+    if ((addr & 0xfffe0000) != 0xfffc0000)
+        return 1;
+
+    return !!(dev->pci_conf_sb[0][0x57] & (0x80 >> ((addr >> 16) & 1)));
+}
+
+static int
+umc_8886_bios_write_gate(uint32_t addr, void *priv)
+{
+    const umc_8886_t *dev = (umc_8886_t *) priv;
+
+    return !(dev->pci_conf_sb[0][0x47] & 0x40) && umc_8886_bios_read_gate(addr, priv);
 }
 
 static uint8_t
@@ -380,6 +407,7 @@ umc_8886_reset(void *priv)
     for (uint8_t i = 1; i < 5; i++) /* Disable all IRQ interrupts */
         pci_set_irq_routing(i, PCI_IRQ_DISABLED);
 
+    flash_bios_decode_changed();
     umc_8886_bus_recalc(dev);
 }
 
@@ -388,6 +416,14 @@ umc_8886_close(void *priv)
 {
     umc_8886_t *dev = (umc_8886_t *) priv;
 
+    if (flash_bios_write_gate_priv == dev) {
+        flash_bios_write_gate      = NULL;
+        flash_bios_write_gate_priv = NULL;
+    }
+    if (flash_bios_read_gate_priv == dev) {
+        flash_bios_read_gate      = NULL;
+        flash_bios_read_gate_priv = NULL;
+    }
     free(dev);
 }
 
@@ -421,6 +457,11 @@ umc_8886_init(const device_t *info)
 
     if (machine_get_kbc_device(machine) == NULL)
         device_add_params(&kbc_at_device, (void *) KBC_VEN_UMC);
+
+    flash_bios_write_gate      = umc_8886_bios_write_gate;
+    flash_bios_write_gate_priv = dev;
+    flash_bios_read_gate       = umc_8886_bios_read_gate;
+    flash_bios_read_gate_priv  = dev;
 
     umc_8886_reset(dev);
 

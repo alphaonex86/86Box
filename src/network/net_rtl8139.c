@@ -482,6 +482,8 @@ struct RTL8139State {
     mem_mapping_t bar_mem;
     rom_t         boot_rom;
     uint32_t      boot_rom_size;
+    uint16_t      device_id;   /* PCI device ID: clones differ, e.g. 10ec:8039 */
+    int           no_cplus;    /* a plain RTL8139C: no C+ command register (drivers use the legacy mode) */
     uint8_t       rom_bar[4];
 
     /* Support migration to/from old versions */
@@ -1333,6 +1335,8 @@ rtl8139_CpCmd_write(RTL8139State *s, uint32_t val)
 
     rtl8139_log("C+ command register write(w) val=0x%04x\n", val);
 
+    if (s->no_cplus)
+        return;
     s->cplus_enabled = 1;
 
     /* mask unwritable bits */
@@ -3333,9 +3337,9 @@ rtl8139_pci_read(UNUSED(int func), int addr, UNUSED(int len), void *priv)
         case 0x01:
             return 0x10;
         case 0x02:
-            return s->rtl8169 ? 0x69 : 0x39;
+            return s->device_id & 0xff;
         case 0x03:
-            return 0x81;
+            return s->device_id >> 8;
         case 0x07:
             return 0x02;
         case 0x06:
@@ -3367,9 +3371,9 @@ rtl8139_pci_read(UNUSED(int func), int addr, UNUSED(int len), void *priv)
         case 0x2d:
             return 0x10;
         case 0x2e:
-            return s->rtl8169 ? 0x69 : 0x39;
+            return s->device_id & 0xff;
         case 0x2f:
-            return 0x81;
+            return s->device_id >> 8;
         case 0x30 ... 0x33:
             return s->rom_bar[addr & 3];
         case 0x34:
@@ -3502,7 +3506,11 @@ nic_init(const device_t *info)
 
     /* PCI vendor and device ID should be mirrored here */
     eep_data[1] = 0x10EC;
-    eep_data[2] = s->rtl8169 ? 0x8169 : 0x8139;
+    s->device_id = device_get_config_hex16("device_id");
+    s->no_cplus  = !s->rtl8169 && !device_get_config_int("cplus");
+    if (!s->device_id)
+        s->device_id = s->rtl8169 ? 0x8169 : 0x8139;
+    eep_data[2] = s->device_id;
 
     /* XXX: Get proper MAC addresses from real EEPROM dumps. OID is generic Realtek */
     eep_data[7] = 0xe000;
@@ -3602,6 +3610,28 @@ static const device_config_t rtl8139c_config[] = {
         .selection      = { { 0 } },
         .bios           = { { 0 } }
     },
+    {
+        .name           = "device_id",
+        .description    = "PCI device ID (0 = standard)",
+        .type           = CONFIG_HEX16,
+        .default_string = NULL,
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "cplus",
+        .description    = "C+ mode (off: a plain RTL8139C)",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 1,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
     { .name = "", .description = "", .type = CONFIG_END }
 };
 
@@ -3621,6 +3651,17 @@ static const device_config_t rtl8169_config[] = {
         .name           = "bios",
         .description    = "Boot ROM (" ROM_PATH_RTL8169 ")",
         .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "device_id",
+        .description    = "PCI device ID (0 = standard)",
+        .type           = CONFIG_HEX16,
         .default_string = NULL,
         .default_int    = 0,
         .file_filter    = NULL,

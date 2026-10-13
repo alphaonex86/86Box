@@ -89,6 +89,7 @@ flash_read(uint32_t addr, void *priv)
 
     if (!flash_bios_read_selected(addr))
         return 0xff;
+    flash_read_bytes++;
 
     if (dev->flags & FLAG_INV_A16)
         addr ^= 0x10000;
@@ -126,6 +127,7 @@ flash_readw(uint32_t addr, void *priv)
     if (!flash_bios_read_selected(addr))
         return 0xffff;
 
+    flash_read_bytes += 2;
     if (dev->flags & FLAG_INV_A16)
         addr ^= 0x10000;
     addr &= biosmask;
@@ -166,6 +168,7 @@ flash_readl(uint32_t addr, void *priv)
     if (!flash_bios_read_selected(addr))
         return 0xffffffff;
 
+    flash_read_bytes += 4;
     if (dev->flags & FLAG_INV_A16)
         addr ^= 0x10000;
     addr &= biosmask;
@@ -173,6 +176,15 @@ flash_readl(uint32_t addr, void *priv)
     q = (uint32_t *) &(dev->array[addr]);
 
     return *q;
+}
+
+/* Board signal VPP: without 12 V (BOX86_FLASH_VPP=5, JP13) program/erase fail with the VPP status bit,
+   commands still switch modes. */
+static int
+flash_vpp_low(void)
+{
+    const char *v = getenv("BOX86_FLASH_VPP");
+    return v && !strcmp(v, "5");
 }
 
 static void
@@ -193,6 +205,11 @@ flash_write(uint32_t addr, uint8_t val, void *priv)
 
     switch (dev->command) {
         case CMD_ERASE_SETUP:
+            if (val == CMD_ERASE_CONFIRM && flash_vpp_low()) {
+                dev->status  = 0x88;
+                dev->command = CMD_READ_STATUS;
+                break;
+            }
             if (val == CMD_ERASE_CONFIRM) {
                 for (uint8_t i = 0; i < 6; i++) {
                     if ((i == dev->program_addr) && (addr >= dev->block_start[i]) && (addr <= dev->block_end[i])) {
@@ -208,12 +225,13 @@ flash_write(uint32_t addr, uint8_t val, void *priv)
 
         case CMD_PROGRAM_SETUP:
         case CMD_PROGRAM_SETUP_ALT:
-            if (((addr & bb_mask) != (dev->block_start[6] & bb_mask)) && (addr == dev->program_addr)) {
-                dev->array[addr] = val;
+            if (((addr & bb_mask) != (dev->block_start[6] & bb_mask)) && (addr == dev->program_addr)
+                && !flash_vpp_low()) {
+                dev->array[addr] &= val;
                 dev->dirty = 1;
             }
             dev->command = CMD_READ_STATUS;
-            dev->status  = 0x80;
+            dev->status  = flash_vpp_low() ? 0x88 : 0x80;
             break;
 
         default:
