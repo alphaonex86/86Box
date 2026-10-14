@@ -18,6 +18,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 
@@ -30,6 +31,7 @@
 #include "x86seg.h"
 #include <86box/machine.h>
 #include <86box/device.h>
+#include <86box/postcard.h>
 #include <86box/dma.h>
 #include <86box/io.h>
 #include <86box/keyboard.h>
@@ -262,6 +264,8 @@ reset_common(int hard)
         else
             return;
     }
+
+    box86_postlog("RESET %s", hard ? "hard" : "soft");
 
     /* Make sure to gracefully leave SMM. */
     if (in_smm)

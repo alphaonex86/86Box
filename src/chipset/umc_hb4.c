@@ -111,6 +111,7 @@
 #include <86box/io.h>
 #include <86box/device.h>
 #include <86box/mem.h>
+#include <86box/dma.h>
 #include <86box/pci.h>
 #include <86box/plat_unused.h>
 #include <86box/port_92.h>
@@ -174,6 +175,8 @@ typedef struct hb4_t {
     uint8_t      *l2_data;
     uint8_t      *l2_tag;     /* per 16-byte line: tag, bit 7 = dirty with 7-bit tags (51h bit 0 clear) */
     uint8_t      *l2_bad;     /* line not equal to DRAM: never filled, or DRAM/SRAM changed behind it */
+    uint32_t      l2_fault[3]; /* BOX86_L2_FAULT=bank:lane:mask: those data bits of that SRAM chip read 0 */
+    uint8_t       l2_tag_fault; /* BOX86_L2_TAG_FAULT=mask: those bits of the tag RAM chip read 0 */
     int           l2_touched; /* 50h/5Ah written since the last settle check */
     int           l2_settled; /* no bad line and L2 on: transparent for the CPU, the fast RAM path is back */
     pc_timer_t    l2_timer;
@@ -452,6 +455,15 @@ hb4_l2_byte(hb4_t *dev, uint32_t addr)
     return size ? &dev->l2_data[addr & (size - 1)] : NULL;
 }
 
+/* A byte read from the L2 data SRAM, chip by bank (A2 with two banks) and byte lane, with the injected fault */
+static uint8_t
+hb4_l2_sram(const hb4_t *dev, uint32_t addr, uint8_t val)
+{
+    if (dev->l2_fault[2] && ((addr >> 2 & 1) == dev->l2_fault[0]) && ((addr & 3) == dev->l2_fault[1]))
+        val &= ~dev->l2_fault[2];
+    return val;
+}
+
 /* DRAM behind the caches: flat RAM or SIMM cells; unanswered reads float high. */
 static uint8_t
 hb4_dram_load(hb4_t *dev, uint32_t addr)
@@ -561,13 +573,13 @@ hb4_l2_load(hb4_t *dev, uint32_t addr)
     if (!data)
         return hb4_dram_load(dev, addr);
     if ((r50 & 0x80) && ((dev->l2_tag[line] & mask) == tag))
-        return data[addr & 15];
+        return hb4_l2_sram(dev, addr, data[addr & 15]);
     if ((r50 & 0x40) && ((mask == 0xff) || (dev->l2_tag[line] & 0x80)))
         for (int i = 0; i < 16; i++)
             hb4_dram_store(dev, (dev->l2_tag[line] & mask) * prog + base + i, data[i]);
     for (int i = 0; i < 16; i++)
         data[i] = hb4_dram_load(dev, (addr & ~15u) + i);
-    dev->l2_tag[line] = tag | ((r50 & 0x40) ? 0 : (dev->l2_tag[line] & 0x80 & ~mask));
+    dev->l2_tag[line] = (tag | ((r50 & 0x40) ? 0 : (dev->l2_tag[line] & 0x80 & ~mask))) & ~dev->l2_tag_fault;
     dev->l2_bad[line] = 0;
     return data[addr & 15];
 }
@@ -585,7 +597,7 @@ hb4_l2_store(hb4_t *dev, uint32_t addr, uint8_t val)
     if (hit && (r50 & 0x80)) {
         data[addr & 15] = val;
         if ((r50 & 0x40) && (mask != 0xff))
-            dev->l2_tag[line] |= 0x80;
+            dev->l2_tag[line] = (dev->l2_tag[line] | 0x80) & ~dev->l2_tag_fault;
     }
     /* also in write-back: code is fetched from DRAM directly (exec pointer), and a later write-back of
        this line writes the same bytes; random power-on dirty lines still write garbage back */
@@ -598,7 +610,7 @@ hb4_load(hb4_t *dev, uint32_t addr)
 {
     if (hb4_l2_forced(dev)) {
         uint8_t *byte = hb4_l2_byte(dev, addr);
-        return byte ? *byte : 0xff;
+        return byte ? hb4_l2_sram(dev, addr, *byte) : 0xff;
     }
     return hb4_l2_active(dev) ? hb4_l2_load(dev, addr) : hb4_dram_load(dev, addr);
 }
@@ -624,6 +636,8 @@ hb4_l1_line(hb4_t *dev, uint32_t addr, int read)
     uint32_t tag = (addr & ~15) | 1;
     uint32_t set = (addr >> 4) % L1_SETS;
 
+    if (dma_bm_busy) /* bus master cycles: the CPU's L1 neither fills nor answers */
+        return NULL;
     for (int way = 0; way < L1_WAYS; way++)
         if (dev->l1_tag[set][way] == tag)
             return dev->l1_car ? dev->l1_data[set][way] : NULL;
@@ -1044,6 +1058,16 @@ hb4_init(UNUSED(const device_t *info))
                             hb4_stuck_readw, hb4_stuck_readl, hb4_ram_writeb, hb4_ram_writew, hb4_ram_writel,
                             NULL, 0, dev);
         /* power-on SRAM contents: random, reproducible with BOX86_L2_SEED */
+        const char *tag_fault = getenv("BOX86_L2_TAG_FAULT");
+        if (tag_fault)
+            dev->l2_tag_fault = strtoul(tag_fault, NULL, 16);
+        const char *fault = getenv("BOX86_L2_FAULT");
+        unsigned    bank, lane, bits;
+        if (fault && (sscanf(fault, "%u:%u:%x", &bank, &lane, &bits) == 3)) {
+            dev->l2_fault[0] = bank & 1;
+            dev->l2_fault[1] = lane & 3;
+            dev->l2_fault[2] = bits & 0xff;
+        }
         const char *seed = getenv("BOX86_L2_SEED");
         uint64_t    x    = seed ? strtoull(seed, NULL, 0) : 1;
         for (uint32_t i = 0; i < (1 << 20); i++) {

@@ -18,6 +18,7 @@
 #include <86box/dma.h>
 #include <86box/io.h>
 #include <86box/pci.h>
+#include <86box/postcard.h>
 #include <86box/timer.h>
 #include <86box/usb_uhci.h>
 
@@ -408,6 +409,7 @@ typedef struct uhci_t {
     uint16_t   io_base;
     uint16_t   cmd, sts, intr, frnum;
     uint32_t   flbase;
+    int        dma_on;  /* schedule run with bus mastering, as last logged */
     uint8_t    sof;
     uint16_t   portsc[2];
     usbdev_t   dev[2];
@@ -501,7 +503,7 @@ static void
 uhci_frame(void *priv)
 {
     uhci_t  *u    = (uhci_t *) priv;
-    uint32_t link = rd32(u->flbase + (u->frnum & 0x3ff) * 4), next;
+    uint32_t link, next;
 
     timer_on_auto(&u->frame_timer, 1000.0);
     Frames++;
@@ -509,8 +511,9 @@ uhci_frame(void *priv)
         u->dev[1].present = 0;
         u->portsc[1]      = PORT_CSC | PORT_PEC;
     }
-    if (!(u->cmd & CMD_RS) || !(u->pci[0x04] & 4))     /* stopped, or no bus mastering */
+    if (!u->dma_on)                                     /* stopped, or no bus mastering */
         return;
+    link = rd32(u->flbase + (u->frnum & 0x3ff) * 4);
     for (int i = 0; i < 256 && !(link & 1); i++) {
         uint32_t addr = link & ~0xf;
         if (link & 2) {                                 /* queue head: its TDs until one is not done */
@@ -542,6 +545,16 @@ uhci_port_reset(uhci_t *u)
     }
 }
 
+/* Schedule run with bus mastering: changes go to the POST log (tests: no USB DMA may outlive a reboot) */
+static void
+uhci_dma_check(uhci_t *u)
+{
+    if (u->dma_on != ((u->cmd & CMD_RS) && (u->pci[0x04] & 4))) {
+        u->dma_on = !u->dma_on;
+        box86_postlog("USB-DMA %s", u->dma_on ? "on" : "off");
+    }
+}
+
 static void
 uhci_reset(uhci_t *u)
 {
@@ -550,6 +563,7 @@ uhci_reset(uhci_t *u)
     u->flbase = 0;
     u->sof    = 0x40;
     uhci_port_reset(u);
+    uhci_dma_check(u);
 }
 
 static uint16_t
@@ -594,6 +608,7 @@ uhci_writew(uint16_t port, uint16_t val, void *priv)
             }
             u->cmd = val;
             u->sts = (u->sts & ~STS_HALTED) | (val & CMD_RS ? 0 : STS_HALTED);
+            uhci_dma_check(u);
             break;
         case 0x02: u->sts &= ~(val & 0x1f); uhci_irq(u); break;
         case 0x04: u->intr = val & 0x0f; uhci_irq(u); break;
@@ -660,7 +675,7 @@ uhci_pci_write(int func, int addr, int len, uint8_t val, void *priv)
     if (func)
         return;
     switch (addr) {
-        case 0x04: u->pci[0x04] = val & 0x07; uhci_io(u, 1); break;
+        case 0x04: u->pci[0x04] = val & 0x07; uhci_io(u, 1); uhci_dma_check(u); break;
         case 0x0d: u->pci[0x0d] = val; break;
         case 0x20: u->pci[0x20] = (val & 0xe0) | 1; uhci_io(u, 1); break;
         case 0x21: u->pci[0x21] = val; uhci_io(u, 1); break;
@@ -722,8 +737,8 @@ static void
 uhci_device_reset(void *priv)
 {
     uhci_t *u = (uhci_t *) priv;
-    uhci_reset(u);
     u->pci[0x04] = 0;
+    uhci_reset(u);
     uhci_io(u, 0);
 }
 

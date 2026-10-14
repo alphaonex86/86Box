@@ -21,6 +21,7 @@ extern "C" {
 
 /* Global variables. */
 extern const device_t postcard_device;
+extern void           box86_postlog(const char *fmt, ...);
 
 /* Functions. */
 

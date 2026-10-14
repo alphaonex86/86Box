@@ -3533,6 +3533,8 @@ dma_mode(int channel)
 }
 
 /* DMA Bus Master Page Read/Write */
+int dma_bm_busy; /* a bus master is accessing memory, not the CPU (fork: its caches stay out) */
+
 void
 dma_bm_read(uint32_t PhysAddress, uint8_t *DataRead, uint32_t TotalSize, int TransferSize)
 {
@@ -3550,6 +3552,7 @@ dma_bm_read(uint32_t PhysAddress, uint8_t *DataRead, uint32_t TotalSize, int Tra
     DataRead += n;
     TotalSize -= n;
 
+    dma_bm_busy = 1;
     n  = TotalSize & ~(TransferSize - 1);
     n2 = TotalSize - n;
 
@@ -3564,6 +3567,7 @@ dma_bm_read(uint32_t PhysAddress, uint8_t *DataRead, uint32_t TotalSize, int Tra
         mem_read_phys((void *) bytes, PhysAddress + n, TransferSize);
         memcpy((void *) &(DataRead[n]), bytes, n2);
     }
+    dma_bm_busy = 0;
 }
 
 void
@@ -3583,6 +3587,7 @@ dma_bm_write(uint32_t PhysAddress, const uint8_t *DataWrite, uint32_t TotalSize,
         DataWrite += n;
         TotalSize -= n;
 
+        dma_bm_busy = 1;
         n  = TotalSize & ~(TransferSize - 1);
         n2 = TotalSize - n;
 
@@ -3598,6 +3603,7 @@ dma_bm_write(uint32_t PhysAddress, const uint8_t *DataWrite, uint32_t TotalSize,
             memcpy(bytes, (void *) &(DataWrite[n]), n2);
             mem_write_phys((void *) bytes, PhysAddress + n, TransferSize);
         }
+        dma_bm_busy = 0;
     }
 
     if (dma_at)
