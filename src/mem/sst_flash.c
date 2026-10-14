@@ -39,6 +39,7 @@ typedef struct sst_t {
     uint8_t sdp;
     uint8_t bbp_first_8k;
     uint8_t bbp_last_8k;
+    uint32_t board_a17;  /* 0x20000: the board wires A17 of the socket high (MB-8433UUD-A, a 1 Mbit socket) */
 
     int command_state;
     int id_mode;
@@ -361,6 +362,8 @@ static void
 sst_write(uint32_t addr, uint8_t val, void *priv)
 {
     sst_t *dev = (sst_t *) priv;
+
+    addr |= dev->board_a17;
     uint32_t mask = 0x7fff;
     uint32_t addr0 = 0x5555;
     uint32_t addr1 = 0x2aaa;
@@ -453,6 +456,8 @@ sst_read(uint32_t addr, void *priv)
     const sst_t  *dev = (sst_t *) priv;
     uint8_t       ret = 0xff;
 
+    addr |= dev->board_a17;
+
     addr &= 0x000fffff;
 
     if (dev->id_mode)
@@ -471,6 +476,8 @@ sst_readw(uint32_t addr, void *priv)
     sst_t   *dev = (sst_t *) priv;
     uint16_t ret = 0xffff;
 
+    addr |= dev->board_a17;
+
     addr &= 0x000fffff;
 
     if (dev->id_mode)
@@ -488,6 +495,8 @@ sst_readl(uint32_t addr, void *priv)
 {
     sst_t   *dev = (sst_t *) priv;
     uint32_t ret = 0xffffffff;
+
+    addr |= dev->board_a17;
 
     addr &= 0x000fffff;
 
@@ -587,6 +596,10 @@ sst_init(const device_t *info)
     dev->size = info->local & 0xffff0000;
     if ((dev->size == 0x20000) && ((machines[machine].init == machine_xt_xi8088_init) && !xi8088_bios_128kb()))
         dev->size = 0x10000;
+
+    /* the MB-8433UUD-A's socket is for 1 Mbit chips: A17 of a 2 Mbit one stays high, its lower half unreachable */
+    if ((dev->size == 0x40000) && !strcmp(machine_get_internal_name(), "84xxuuda"))
+        dev->board_a17 = 0x20000;
 
     dev->mask         = dev->size - 1;
     dev->page_mask    = dev->mask & 0xffffff80; /* Filter out A0-A6. */

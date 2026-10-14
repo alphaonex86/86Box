@@ -133,7 +133,6 @@ static mem_mapping_t *read_mapping_bus[MEM_MAPPINGS_NO];
 static mem_mapping_t *write_mapping_bus[MEM_MAPPINGS_NO];
 static uint8_t       _mem_wp[MEM_MAPPINGS_NO];
 static uint8_t       _mem_wp_bus[MEM_MAPPINGS_NO];
-static uint8_t        ff_pccache[4] = { 0xff, 0xff, 0xff, 0xff };
 static mem_state_t    _mem_state[MEM_MAPPINGS_NO];
 static uint32_t       remap_start_addr;
 static uint32_t       remap_start_addr2;
@@ -673,7 +672,13 @@ getpccache(uint32_t a)
 
     mem_log("Bad getpccache %08X%08X\n", (uint32_t) (a64 >> 32), (uint32_t) (a64 & 0xffffffffULL));
 
-    return (uint8_t *) &ff_pccache;
+    /* fork: code where no exec pointer is (VGA memory, unmapped: FFh), as a CPU does: its 4 KB page copied and
+       run from the copy (a jump there crashed 86Box itself) */
+    static uint8_t page_copy[4096];
+    for (uint32_t i = 0; i < 4096; i++)
+        page_copy[i] = read_mapping[a64 >> MEM_GRANULARITY_BITS] ? read_mem_b((uint32_t) (a64 & ~0xfffULL) + i) : 0xff;
+    p = page_copy - (uintptr_t) (a2 & ~0xfff);
+    return (uint8_t *) (((uintptr_t) p & 0x00000000ffffffffULL) | ((uintptr_t) page_copy & 0xffffffff00000000ULL));
 }
 
 uint8_t

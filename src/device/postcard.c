@@ -140,9 +140,27 @@ postcard_reset(void)
     postcard_setui();
 }
 
+/* Firmware tests (BOX86_POSTLOG): every code written, CPU resets and USB bus mastering, one event per line */
+void
+box86_postlog(const char *fmt, ...)
+{
+    const char *log = getenv("BOX86_POSTLOG");
+    FILE       *fp;
+    va_list     ap;
+    if (!log || !(fp = fopen(log, "a")))
+        return;
+    va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    va_end(ap);
+    fputc('\n', fp);
+    fclose(fp);
+}
+
 static void
 postcard_write(uint16_t port, uint8_t val, UNUSED(void *priv))
 {
+    if (!(port & POSTCARD_MASK))
+        box86_postlog("%02X", val);   /* every write: a step run twice shows twice */
     if (postcard_written[port & POSTCARD_MASK] &&
         (val == postcard_codes[port & POSTCARD_MASK]))
         return;
@@ -150,12 +168,6 @@ postcard_write(uint16_t port, uint8_t val, UNUSED(void *priv))
     postcard_prev_codes[port & POSTCARD_MASK] = postcard_codes[port & POSTCARD_MASK];
     postcard_codes[port & POSTCARD_MASK]      = val;
 
-    const char *log = getenv("BOX86_POSTLOG"); /* firmware tests: every new code, one per line */
-    FILE       *fp;
-    if (log && !(port & POSTCARD_MASK) && (fp = fopen(log, "a"))) {
-        fprintf(fp, "%02X\n", val);
-        fclose(fp);
-    }
     if (postcard_written[port & POSTCARD_MASK] < 2)
         postcard_written[port & POSTCARD_MASK]++;
 
