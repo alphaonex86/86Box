@@ -737,8 +737,9 @@ nvr_read(uint16_t addr, void *priv)
 
             case RTC_REGD:
                 /* Bits 6-0 of this register always read 0. Bit 7 is battery state,
-                   we should always return it set, as that means the battery is OK. */
-                ret = REGD_VRT;
+                   we should always return it set, as that means the battery is OK.
+                   BOX86_RTC_DEAD=1: a dead battery (Dallas module), VRT reads 0 as on the MB-8433UUD-A. */
+                ret = getenv("BOX86_RTC_DEAD") ? 0 : REGD_VRT;
                 break;
 
             case 0x11:

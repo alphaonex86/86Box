@@ -101,7 +101,7 @@ pci_dump(const char *path)
     rename(tmp, path);
 }
 
-static void
+void
 text_dump(const char *path)
 {
     char tmp[CMD_MAX + 8];

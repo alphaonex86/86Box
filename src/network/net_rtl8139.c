@@ -1072,6 +1072,21 @@ rtl8139_reset_phy(RTL8139State *s)
     s->CSCR = CSCR_F_LINK_100 | CSCR_HEART_BIT | CSCR_LD;
 }
 
+static void rtl8139_rom_update(RTL8139State *s);
+
+/* Config0 as the chip loads it from its EEPROM (byte 14h): BS2-0, the boot ROM size, decide whether the expansion
+   ROM BAR exists (real RTL8139C: no BAR at all with 000, and BS2-0 cannot be written at run time) */
+static void
+rtl8139_load_config0(RTL8139State *s)
+{
+    const uint16_t *eep = s->eeprom ? nmc93cxx_eeprom_data(s->eeprom) : (const uint16_t *) s->eeprom_data;
+    uint8_t         bs  = eep[0x0a] & 7;
+
+    s->Config0       = eep[0x0a] & 0xff;
+    s->boot_rom_size = (s->boot_rom.rom && bs >= 1 && bs <= 5) ? 0x1000u << bs : 0;
+    rtl8139_rom_update(s);
+}
+
 static void
 rtl8139_reset(void *priv)
 {
@@ -1113,7 +1128,7 @@ rtl8139_reset(void *priv)
     s->bChipCmdState = CmdReset; /* RxBufEmpty bit is calculated on read from ChipCmd */
 
     /* set initial state data */
-    s->Config0 = 0x0; /* No boot ROM */
+    rtl8139_load_config0(s);
     s->Config1 = 0xC; /* IO mapped and MEM mapped registers available */
     s->Config3 = 0x1; /* fast back-to-back compatible */
     s->Config5 = 0x0;
@@ -1365,6 +1380,8 @@ rtl8139_Cfg9346_write(RTL8139State *s, uint32_t val)
         val = 0;
         rtl8139_reset(s);
     }
+    if (opmode != 0x80 && (s->Cfg9346 & 0xc0) == 0x80)
+        nmc93cxx_eeprom_write(s->eeprom, 0, 0, 0);   /* out of programming mode: the chip drives EECS low */
 
     s->Cfg9346 = val;
 }
@@ -1399,8 +1416,8 @@ rtl8139_Config0_write(RTL8139State *s, uint32_t val)
         return;
     }
 
-    /* mask unwritable bits */
-    val = SET_MASKED(val, 0xf8, s->Config0);
+    /* mask unwritable bits: all, BS2-0 too (a real RTL8139C keeps them; they come from the EEPROM) */
+    val = SET_MASKED(val, 0xff, s->Config0);
 
     s->Config0 = val;
 }
@@ -3254,10 +3271,10 @@ rtl8139_rom_update(RTL8139State *s)
 {
     uint32_t bar = s->rom_bar[0] | (s->rom_bar[1] << 8) | (s->rom_bar[2] << 16) | ((uint32_t) s->rom_bar[3] << 24);
 
-    bar &= ~(s->boot_rom_size - 1) | 1;
+    bar = s->boot_rom_size ? (bar & (~(s->boot_rom_size - 1) | 1)) : 0;
     for (int i = 0; i < 4; i++)
         s->rom_bar[i] = bar >> (8 * i);
-    if ((bar & 1) && (s->pci_conf[0x04] & PCI_COMMAND_MEM))
+    if (s->boot_rom_size && (bar & 1) && (s->pci_conf[0x04] & PCI_COMMAND_MEM))
         mem_mapping_set_addr(&s->boot_rom.mapping, bar & ~1u, s->boot_rom_size);
     else
         mem_mapping_disable(&s->boot_rom.mapping);
@@ -3457,26 +3474,43 @@ nic_init(const device_t *info)
     for (uint32_t i = 0; i < 6; i++)
         s->phys[MAC0 + i] = mac_bytes[i];
 
+    uint8_t rom_bs = 0;
+    if (device_get_config_int("bios")) {
+        FILE *fp = rom_fopen(rom_path, "rb");
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            long     len  = ftell(fp);
+            uint32_t size = 0x2000;
+            fclose(fp);
+            for (rom_bs = 1; size < len && size < 0x20000; rom_bs++)
+                size <<= 1;
+            rom_init(&s->boot_rom, rom_path, 0, size, size - 1, 0, MEM_MAPPING_EXTERNAL);
+            mem_mapping_disable(&s->boot_rom.mapping);
+        } else
+            pclog("%s: boot ROM %s not found\n", info->name, rom_path);
+    }
+    eep_data[0x0a] = (eep_data[0x0a] & ~7) | rom_bs;   /* a card set up for the ROM in its socket */
+
+    const char *dump = getenv("BOX86_RTL8139_EEPROM");   /* "ww:xxxx ..." words of a real card's EEPROM */
+    if (dump && !s->rtl8169) {
+        FILE    *fp = fopen(dump, "r");
+        unsigned w, v;
+        if (!fp)
+            fatal("BOX86_RTL8139_EEPROM: cannot open %s\n", dump);
+        while (fscanf(fp, " %x:%x", &w, &v) == 2)
+            if (w < 64)
+                eep_data[w] = v;
+        fclose(fp);
+        for (uint32_t i = 0; i < 6; i++)
+            s->phys[MAC0 + i] = mac_bytes[i];
+    }
+
     params.type            = NMC_93C46_x16_64;
     params.default_content = s->eeprom_data;
     params.filename        = filename;
     snprintf(filename, sizeof(filename), "nmc93cxx_eeprom_%s_%d.nvr", info->internal_name, s->inst);
     s->eeprom = device_add_inst_params(&nmc93cxx_device, s->inst, &params);
-
-    if (device_get_config_int("bios")) {
-        FILE *fp = rom_fopen(rom_path, "rb");
-        if (fp) {
-            fseek(fp, 0, SEEK_END);
-            long len = ftell(fp);
-            fclose(fp);
-            for (s->boot_rom_size = 0x2000; s->boot_rom_size < len && s->boot_rom_size < 0x20000;)
-                s->boot_rom_size <<= 1;
-            rom_init(&s->boot_rom, rom_path, 0, s->boot_rom_size, s->boot_rom_size - 1, 0,
-                     MEM_MAPPING_EXTERNAL);
-            mem_mapping_disable(&s->boot_rom.mapping);
-        } else
-            pclog("%s: boot ROM %s not found\n", info->name, rom_path);
-    }
+    rtl8139_load_config0(s);
 
     s->nic = network_attach(s, (uint8_t *) &s->phys[MAC0], rtl8139_do_receive, rtl8139_set_link_status);
     timer_add(&s->timer, rtl8139_timer, s, 0);
