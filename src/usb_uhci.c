@@ -401,7 +401,7 @@ enum { CMD_RS = 1, CMD_HCRESET = 2, CMD_GRESET = 4 };
 enum { STS_USBINT = 1, STS_ERROR = 2, STS_HALTED = 0x20 };
 enum { PORT_CCS = 1, PORT_CSC = 2, PORT_PE = 4, PORT_PEC = 8, PORT_LSDA = 0x100, PORT_RESET = 0x200 };
 enum { TD_ACTIVE = 1 << 23, TD_STALLED = 1 << 22, TD_NAK = 1 << 19, TD_TIMEOUT = 1 << 18, TD_IOC = 1 << 24,
-       TD_LS = 1 << 26 };
+       TD_LS = 1 << 26, TD_SPD = 1 << 29 };
 
 typedef struct uhci_t {
     uint8_t    pci[256];
@@ -450,14 +450,15 @@ wr32(uint32_t addr, uint32_t v)
     dma_bm_write(addr, (uint8_t *) &v, 4, 4);
 }
 
-/* One TD: 1 done (or not active), 0 NAK (left active), -1 error (stalled or no device). */
+/* One TD: 1 done, 0 NAK or not active (a queue head stays on it: Linux appends to its inactive dummy TD), -1 error
+   (stalled or no device). */
 static int
 uhci_td(uhci_t *u, uint32_t td, uint32_t *link)
 {
     uint32_t status = rd32(td + 4), token = rd32(td + 8), buffer = rd32(td + 12);
     *link = rd32(td);
     if (!(status & TD_ACTIVE))
-        return 1;
+        return 0;
     int       pid = token & 0xff, addr = (token >> 8) & 0x7f, ep = (token >> 15) & 0xf;
     int       maxlen = ((token >> 21) + 1) & 0x7ff;
     uint8_t   buf[1024];
@@ -495,6 +496,10 @@ uhci_td(uhci_t *u, uint32_t td, uint32_t *link)
     if (n < 0) {
         u->sts |= STS_ERROR;
         return -1;
+    }
+    if (pid == 0x69 && n < maxlen && (status & TD_SPD)) {   /* short packet: the queue head stays on this TD */
+        u->sts |= STS_USBINT;
+        return 0;
     }
     return 1;
 }

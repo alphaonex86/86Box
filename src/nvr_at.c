@@ -751,9 +751,12 @@ nvr_read(uint16_t addr, void *priv)
                 /* Bits 6-0 of this register always read 0. Bit 7 is the battery state
                    (VRT): it can only be set by reading Register D and only cleared by
                    pulling the PS pin low, so a battery/power-loss event is reported
-                   for exactly once. */
+                   for exactly once.
+                   BOX86_RTC_DEAD=1: a dead battery (Dallas module), VRT reads 0 as on the MB-8433UUD-A. */
                 ret = nvr->regs[RTC_REGD] & REGD_VRT;
-                if ((nvr->regs[RTC_REGD] & REGD_VRT) != REGD_VRT) {
+                if (getenv("BOX86_RTC_DEAD"))
+                    ret = 0;
+                else if ((nvr->regs[RTC_REGD] & REGD_VRT) != REGD_VRT) {
                     nvr->regs[RTC_REGD] = (nvr->regs[RTC_REGD] & 0x7f) | REGD_VRT;
                     nvr_dosave          = 1;
                 }

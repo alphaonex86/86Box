@@ -166,6 +166,9 @@ postcard_write(uint16_t port, uint8_t val, UNUSED(void *priv))
 
     if (!idx)
         box86_postlog("%02X", val);   /* every write: a step run twice shows twice */
+    const char *shot = getenv("BOX86_POSTTEXT");   /* "XX:file": the text screen when POST code XX is written */
+    if (!idx && shot && strlen(shot) > 3 && strtoul(shot, NULL, 16) == val)
+        text_dump(shot + 3);
     if (postcard_written[idx] &&
         (val == postcard_codes[idx]))
         return;
