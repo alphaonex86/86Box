@@ -795,6 +795,10 @@ fdc_sis(fdc_t *fdc)
         }
     }
 
+    /* The INT line goes down once the last pending interrupt is sensed, as on the 8272/82077. */
+    if (!fdc->reset_stat && !fdc->fintr && (fdc->irq != 0xff))
+        picintc(1 << fdc->irq);
+
     fdc->res[10] = fdc->pcn[fdc->res[9] & 3];
 
     fdc_log("Sense interrupt status: 2 parameters to go\n");

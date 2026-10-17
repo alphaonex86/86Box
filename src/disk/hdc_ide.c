@@ -99,8 +99,10 @@
 #define WIN_STANDBYNOW1                0xe0
 #define WIN_IDLENOW1                   0xe1
 #define WIN_SETIDLE1                   0xe3
+#define WIN_READ_BUFFER                0xe4 /* The 512-byte sector buffer, to the host */
 #define WIN_CHECKPOWERMODE1            0xe5
 #define WIN_SLEEP1                     0xe6
+#define WIN_WRITE_BUFFER               0xe8 /* The 512-byte sector buffer, from the host */
 #define WIN_IDENTIFY                   0xec /* Ask drive to identify itself */
 #define WIN_SET_FEATURES               0xef
 #define WIN_READ_NATIVE_MAX            0xf8
@@ -1007,6 +1009,24 @@ ide_set_sector(ide_t *ide, int64_t sector_num)
         ide->tf->head      = ((r / hdd[ide->hdd_num].spt) & 0x0f) & 0xff;
         ide->tf->sector   = ((r % hdd[ide->hdd_num].spt) + 1) & 0xff;
     }
+}
+
+/* BOX86_IDE_BAD_LBA=<lba>[,<lba>...] (decimal): sectors that VERIFY cannot read back: the first one in the command's
+   range, -1 if none. */
+static int64_t
+ide_bad_sector(ide_t *ide)
+{
+    const char *p     = getenv("BOX86_IDE_BAD_LBA");
+    int64_t     first = ide_get_sector(ide);
+    int64_t     last  = ide_get_last_sector(ide);
+    int64_t     bad   = -1;
+
+    for (; p && *p; p = strchr(p, ',') ? strchr(p, ',') + 1 : "") {
+        int64_t lba = strtoll(p, NULL, 10);
+        if ((lba >= first) && (lba <= last) && ((bad < 0) || (lba < bad)))
+            bad = lba;
+    }
+    return bad;
 }
 
 static void
@@ -2066,6 +2086,24 @@ ide_writeb(uint16_t addr, uint8_t val, void *priv)
                     }
                     break;
 
+                case WIN_WRITE_BUFFER:
+                    if (ide->type == IDE_ATAPI)
+                        bad = 1;
+                    else {
+                        ide->tf->atastat = DRQ_STAT | DSC_STAT | DRDY_STAT;
+                        ide->tf->pos     = 0;
+                    }
+                    break;
+
+                case WIN_READ_BUFFER:
+                    if (ide->type == IDE_ATAPI)
+                        bad = 1;
+                    else {
+                        ide->tf->atastat = BSY_STAT;
+                        ide_set_callback(ide, 100.0 * IDE_TIME);
+                    }
+                    break;
+
                 case 0xf0:
                 default:
                     bad = 1;
@@ -2105,7 +2143,11 @@ ide_read_data(ide_t *ide)
             ide->tf->pos = 0;
         }
     } else {
-        ret = idebufferw[ide->tf->pos >> 1];
+        /* BOX86_IDE_DATA_FAULT=<hex mask>: those data lines of the cable read 0 (a broken wire). */
+        static int data_fault = -1;
+        if (data_fault < 0)
+            data_fault = getenv("BOX86_IDE_DATA_FAULT") ? strtol(getenv("BOX86_IDE_DATA_FAULT"), NULL, 16) : 0;
+        ret = idebufferw[ide->tf->pos >> 1] & ~data_fault;
         ide->tf->pos += 2;
 
         if (ide->tf->pos >= 512) {
@@ -2734,9 +2776,13 @@ ide_callback(void *priv)
         case WIN_VERIFY_ONCE:
             if (ide->type == IDE_ATAPI)
                 err = ABRT_ERR;
-            else if (!ide->tf->lba && (ide->cfg_spt == 0))
+            else if ((!ide->tf->lba && (ide->cfg_spt == 0)) ||
+                     (ide_get_last_sector(ide) > hdd_image_get_last_sector(ide->hdd_num)))
                 err = IDNF_ERR;
-            else {
+            else if (ide_bad_sector(ide) >= 0) {
+                ide_set_sector(ide, ide_bad_sector(ide));   /* the error's address, as a drive leaves it */
+                err = UNC_ERR;
+            } else {
                 ide->tf->pos     = 0;
                 ide->tf->atastat = DRDY_STAT | DSC_STAT;
                 ide_irq_raise(ide);
@@ -2824,6 +2870,17 @@ ide_callback(void *priv)
                 ide_irq_raise(ide);
             } else
                 err = ABRT_ERR;
+            break;
+
+        case WIN_READ_BUFFER:
+            ide->tf->pos     = 0;
+            ide->tf->atastat = DRQ_STAT | DRDY_STAT | DSC_STAT;
+            ide_irq_raise(ide);
+            break;
+
+        case WIN_WRITE_BUFFER:
+            ide->tf->atastat = DRDY_STAT | DSC_STAT;
+            ide_irq_raise(ide);
             break;
 
         case WIN_IDENTIFY: /* Identify Device */

@@ -2008,6 +2008,25 @@ svga_write_common(uint32_t addr, uint8_t val, uint8_t linear, void *priv)
         svga->gdcreg[8] = wm;
 }
 
+/* BOX86_VRAM_FAULT=<offset>:<mask> (hex): those bits of the video memory byte at offset read 0 (a bad VRAM chip). */
+static uint32_t
+svga_vram_fault(uint32_t addr, uint32_t val, uint32_t bytes)
+{
+    static int      init;
+    static uint32_t at;
+    static uint32_t mask;
+
+    if (!init) {
+        const char *f = getenv("BOX86_VRAM_FAULT");
+        init          = 1;
+        if (!f || sscanf(f, "%x:%x", &at, &mask) != 2)
+            mask = 0;
+    }
+    if (mask && (at - addr) < bytes)
+        val &= ~(mask << (8 * (at - addr)));
+    return val;
+}
+
 static __inline uint8_t
 svga_read_common(uint32_t addr, uint8_t linear, void *priv)
 {
@@ -2050,7 +2069,7 @@ svga_read_common(uint32_t addr, uint8_t linear, void *priv)
         latch_addr = (addr & svga->vram_mask) & ~3;
         for (uint8_t i = 0; i < count; i++)
             svga->latch.b[i] = svga->vram[latch_addr | i];
-        return svga->vram[addr & svga->vram_mask];
+        return svga_vram_fault(addr & svga->vram_mask, svga->vram[addr & svga->vram_mask], 1);
     } else if (svga->chain4 && !svga->force_old_addr) {
         readplane = addr & 3;
         addr      = ((addr & 0xfffc) << 2) | ((addr & 0x30000) >> 14) | (addr & ~0x3ffff);
@@ -2099,7 +2118,7 @@ svga_read_common(uint32_t addr, uint8_t linear, void *priv)
 
         ret = temp;
     } else
-        ret = svga->vram[addr | readplane];
+        ret = svga_vram_fault(addr | readplane, svga->vram[addr | readplane], 1);
 
     return ret;
 }
@@ -2378,7 +2397,7 @@ svga_readb_linear(uint32_t addr, void *priv)
     if (addr >= svga->vram_max)
         return 0xff;
 
-    return svga->vram[addr & svga->vram_mask];
+    return svga_vram_fault(addr & svga->vram_mask, svga->vram[addr & svga->vram_mask], 1);
 }
 
 uint16_t
@@ -2414,7 +2433,7 @@ svga_readw_common(uint32_t addr, uint8_t linear, void *priv)
     if (addr >= svga->vram_max)
         return 0xffff;
 
-    return *(uint16_t *) &svga->vram[addr & svga->vram_mask];
+    return svga_vram_fault(addr & svga->vram_mask, *(uint16_t *) &svga->vram[addr & svga->vram_mask], 2);
 }
 
 uint16_t
@@ -2472,7 +2491,7 @@ svga_readl_common(uint32_t addr, uint8_t linear, void *priv)
     if (addr >= svga->vram_max)
         return 0xffffffff;
 
-    return *(uint32_t *) &svga->vram[addr & svga->vram_mask];
+    return svga_vram_fault(addr & svga->vram_mask, *(uint32_t *) &svga->vram[addr & svga->vram_mask], 4);
 }
 
 uint32_t

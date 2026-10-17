@@ -738,9 +738,10 @@ bochs_vbe_pci_write(const int func, const int addr, UNUSED(const int len), const
             if (dev->pci_conf_status & PCI_COMMAND_MEM) {
                 mem_mapping_enable(&dev->svga.mapping);
                 if ((dev->pci_regs[0x13] != 0x00) && (dev->pci_regs[0x13] != 0xff)) {
-                    mem_mapping_enable(&dev->linear_mapping);
+                    /* the BAR may have been written while memory decode was off (as BIOSes do): place it now */
+                    mem_mapping_set_addr(&dev->linear_mapping, dev->pci_regs[0x13] << 24, 0x01000000);
                     if (dev->pci_regs[0x13] != 0xe0)
-                        mem_mapping_enable(&dev->linear_mapping_2);
+                        mem_mapping_set_addr(&dev->linear_mapping_2, 0xe0000000, 0x01000000);
                 }
                 if (dev->pci_rom_enable && (dev->rom_addr != 0x0000) && (dev->rom_addr < 0xfff8))
                     mem_mapping_set_addr(&dev->bios_rom.mapping, dev->rom_addr << 16, 0x10000);

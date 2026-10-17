@@ -1694,10 +1694,12 @@ gd54xx_recalc_banking(gd54xx_t *gd54xx)
     svga_t *svga = &gd54xx->svga;
 
     if (!gd54xx_is_5422(svga)) {
-        svga->extra_banks[0] = (svga->gdcreg[0x09] & 0x7f) << 12;
+        /* The GD5420 has up to 1 MB, its BIOS 1024x768x256 VESA mode: 8 offset bits in 4K (the GD5401/02: 7, 512K). */
+        uint8_t mask = (svga->crtc[0x27] >= CIRRUS_ID_CLGD5420) ? 0xff : 0x7f;
+        svga->extra_banks[0] = (svga->gdcreg[0x09] & mask) << 12;
 
         if (svga->gdcreg[0x0b] & CIRRUS_BANKING_DUAL)
-            svga->extra_banks[1] = (svga->gdcreg[0x0a] & 0x7f) << 12;
+            svga->extra_banks[1] = (svga->gdcreg[0x0a] & mask) << 12;
         else
             svga->extra_banks[1] = svga->extra_banks[0] + 0x8000;
     } else {

@@ -11,6 +11,7 @@
  *   shot           save a PNG of the screen in <vm path>/screenshots/ at the next frame
  *   cr0 <file>     append CR0 (hex) to <file>
  *   flash <file>   append "<instructions fetched> <bytes read>" from the BIOS flash since the last flash command
+ *   rtcadd <s>     advance the RTC by <s> seconds (decimal)
  *   reset          hard reset (reset button)
  *   quit           power off (NVR saved)
  */
@@ -22,11 +23,14 @@
 #include <86box/io.h>
 #include <86box/keyboard.h>
 #include <86box/mem.h>
+#include <86box/timer.h>
+#include <86box/nvr.h>
 #include <86box/plat.h>
 #include <86box/thread.h>
 #include <86box/video.h>
 #include <86box/device.h>
 #include <86box/usb_uhci.h>
+#include <86box/machine.h>
 #include "cpu.h"
 
 #define CMD_MAX 1024
@@ -119,10 +123,42 @@ text_dump(const char *path)
     rename(tmp, path);
 }
 
+/* BOX86_LIST_VIDEO=<file>: the video cards valid on the configured machine, one per line
+   "<internal name>|<isa|pci>|<mono|color>|<config section>|<memory option: default, then each value=description>",
+   then exit. */
+static void
+list_video(const char *path)
+{
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        pclog("testctl: cannot write %s\n", path);
+        exit(1);
+    }
+    for (int c = 2; video_card_getdevice(c); c++) {
+        const device_t *dev = video_card_getdevice(c);
+        if (!video_card_available(c) || !device_is_valid(dev, machine))
+            continue;
+        fprintf(fp, "%s|%s|%s|%s|", dev->internal_name, (dev->flags & DEVICE_PCI) ? "pci" : "isa",
+                (video_card_get_flags(c) & VIDEO_FLAG_TYPE_MASK) == VIDEO_FLAG_TYPE_MDA ? "mono" : "color", dev->name);
+        for (const device_config_t *cfg = dev->config; cfg && cfg->type != CONFIG_END; cfg++) {
+            if (strcmp(cfg->name, "memory") || cfg->type != CONFIG_SELECTION)
+                continue;
+            fprintf(fp, "%d", cfg->default_int);
+            for (const device_config_selection_t *sel = cfg->selection; sel->description && sel->description[0]; sel++)
+                fprintf(fp, ",%d=%s", sel->value, sel->description);
+        }
+        fputc('\n', fp);
+    }
+    fclose(fp);
+    exit(0);
+}
+
 void
 testctl_init(void)
 {
     const char *path = getenv("BOX86_TESTCTL");
+    if (getenv("BOX86_LIST_VIDEO"))
+        list_video(getenv("BOX86_LIST_VIDEO"));
     if (!path)
         return;
     testctl_mutex = thread_create_mutex();
@@ -202,6 +238,9 @@ testctl_poll(void)
             fclose(fp);
         }
         flash_fetch_count = flash_read_bytes = 0;
+    } else if (!strcmp(cmd, "rtcadd")) {
+        for (int s = atoi(arg); s > 0; s--)
+            rtc_tick();
     } else if (!strcmp(cmd, "shot"))
         ++monitors[0].mon_screenshots_raw;
     else if (!strcmp(cmd, "reset"))
