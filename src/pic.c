@@ -968,6 +968,13 @@ picint_common(uint16_t num, int level, int set, uint8_t *irq_state)
     if (update_pending == NULL)
         return;
 
+    /* BOX86_IRQ_FAULT=<hex mask>: requests on those IRQ lines never reach the PIC (a broken trace). */
+    static int irq_fault = -1;
+    if (irq_fault < 0)
+        irq_fault = getenv("BOX86_IRQ_FAULT") ? strtol(getenv("BOX86_IRQ_FAULT"), NULL, 16) : 0;
+    if (set && !(num &= ~irq_fault))
+        return;
+
     /* Make sure to ignore all slave IRQ's, and in case of AT+,
        translate IRQ 2 to IRQ 9. */
     for (uint8_t i = 0; i < 8; i++) {

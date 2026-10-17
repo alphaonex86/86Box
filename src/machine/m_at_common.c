@@ -37,6 +37,7 @@
  *   Boston, MA 02111-1307
  *   USA.
  */
+#include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -65,7 +66,7 @@ machine_at_common_init(const machine_t *model)
 {
     machine_common_init(model);
 
-    refresh_at_enable = 1;
+    refresh_at_enable = !getenv("BOX86_REFRESH_DEAD");   /* no refresh request seen in port 61h bit 4 */
     pit_devs[0].set_out_func(pit_devs[0].data, 1, pit_refresh_timer_at);
     pic2_init();
     dma16_init();
