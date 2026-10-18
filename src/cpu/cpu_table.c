@@ -3211,7 +3211,7 @@ const cpu_family_t cpu_families[] = {
         .name          = "Am5x86",
         .internal_name = "am5x86",
         .cpus          = (const CPU[]) {
-            { /* 3 x 40 MHz, as the MB-8433UUD-A of the newBIOS project runs it (CLKMUL low) */
+            { /* 3 x 40 MHz, as the MB-8433UUD-A of the mb-8433UUD project runs it (CLKMUL low) */
                 .name               = "120 (3x40)",
                 .cpu_type           = CPU_ENH_Am486DX,
                 .fpus               = fpus_internal,

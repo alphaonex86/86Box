@@ -52,7 +52,7 @@
 
 /* ALi M1429G */
 /* The board's chip is an Intel P28F001BX-T. BOX86_FLASH: w29c010 (the chip 86Box used before), sst39sf010 (a JEDEC
-   chip newBIOS does not know, as an SST39SF010A put in its place), w49f002a (2 Mbit: a 256 KiB image, its lower
+   chip mb-8433UUD does not know, as an SST39SF010A put in its place), w49f002a (2 Mbit: a 256 KiB image, its lower
    half decoded at FFFC0000 by the UM8886, 57h bits 7-6). */
 static const device_t *
 board_flash_device(void)
