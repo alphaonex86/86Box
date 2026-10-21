@@ -143,6 +143,8 @@ typedef struct atkbc_t {
 
     /* Keyboard still in its power-on self test (BOX86_KBD_POWERON_MS): bytes sent to it time out. */
     int kbd_powering;
+    /* No keyboard plugged (BOX86_KBD_ABSENT, the board's 8042): a byte sent to it hangs the controller, IBF set. */
+    int kbd_absent, hung;
 
     /* P2 pulse callback timer. */
     pc_timer_t pulse_cb;
@@ -467,7 +469,10 @@ kbc_ibf_process(atkbc_t *dev)
     dev->state   = STATE_MAIN_IBF;
     if (dev->status & STAT_CD)
         kbc_at_process_cmd(dev);
-    else {
+    else if (dev->kbd_absent) {
+        dev->status |= STAT_IFULL;
+        dev->hung = 1;
+    } else {
         set_enable_kbd(dev, 1);
         if ((dev->ports[0] != NULL) && (dev->ports[0]->priv != NULL) && !dev->kbd_powering) {
             dev->ports[0]->wantcmd = 1;
@@ -760,7 +765,8 @@ kbc_at_poll(void *priv)
     timer_advance_u64(&dev->kbc_poll_timer, (100ULL * TIMER_USEC));
 
     /* TODO: Implement the password security state. */
-    kbc_at_do_poll(dev);
+    if (!dev->hung)
+        kbc_at_do_poll(dev);
 }
 
 static void
@@ -3024,6 +3030,7 @@ kbc_at_init(const device_t *info)
     const char *kbc_ms = getenv("BOX86_KBC_POWERON_MS"), *kbd_ms = getenv("BOX86_KBD_POWERON_MS");
     if (kbc_ms && atoi(kbc_ms) > 0)             /* microseconds as a double: 64-bit timer units overflow */
         timer_on_auto(&dev->kbc_poll_timer, atoi(kbc_ms) * 1000.0);
+    dev->kbd_absent = getenv("BOX86_KBD_ABSENT") != NULL;
     if (kbd_ms && atoi(kbd_ms) > 0) {
         dev->kbd_powering = 1;
         timer_on_auto(&dev->kbc_dev_poll_timer, atoi(kbd_ms) * 1000.0);
