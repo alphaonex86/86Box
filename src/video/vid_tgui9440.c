@@ -221,10 +221,9 @@ tgui_update_irqs(tgui_t *tgui)
     if (!tgui->pci)
         return;
 
-    if (!(tgui->oldctrl1 & 0x40))
-        pci_set_irq(tgui->pci_slot, PCI_INTA, &tgui->irq_state);
-    else
-        pci_clear_irq(tgui->pci_slot, PCI_INTA, &tgui->irq_state);
+    /* No interrupt source is modelled: INTA held while old control 1 bit 6 was clear stormed the IRQ the board
+       shares with another device (the real card shares IRQ 9 with the USB card's EHCI, no storm). */
+    pci_clear_irq(tgui->pci_slot, PCI_INTA, &tgui->irq_state);
 }
 
 static void
