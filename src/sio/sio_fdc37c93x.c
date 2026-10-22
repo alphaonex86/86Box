@@ -1893,6 +1893,10 @@ fdc37c93x_reset(void *priv)
         /* Bit 2 on the Acer V35N is the text/graphics toggle, bits 1 and 3 = ????. */
         dev->gpio_pulldn[2] = 0x10;
 
+    /* IBM Aptiva 2168: GP21-GP20 = bus speed jumper JP2 (00 = 66, 10 = 60, 11 = 50 MHz). */
+    if (machines[machine].init == machine_at_aptiva2168_init)
+        dev->gpio_pulldn[2] = (cpu_busspeed > 63333333) ? 0xfc : ((cpu_busspeed > 55000000) ? 0xfe : 0xff);
+
     dev->locked = 0;
 }
 

@@ -1432,28 +1432,6 @@ machine_at_gw2kma_init(const machine_t *model)
 }
 
 /* OPTi Viper */
-/* IBM system board register at EAh (index) / EBh (data): index 2 bits 1-0 = bus speed jumper. */
-static uint8_t aptiva_board_index;
-
-static void
-aptiva_board_write(UNUSED(uint16_t addr), uint8_t val, UNUSED(void *priv))
-{
-    aptiva_board_index = val;
-}
-
-static uint8_t
-aptiva_board_read(UNUSED(uint16_t addr), UNUSED(void *priv))
-{
-    if (aptiva_board_index != 0x02)
-        return 0xff;
-
-    if (cpu_busspeed > 63333333)
-        return 0xfc;
-    if (cpu_busspeed > 55000000)
-        return 0xfe;
-    return 0xff;
-}
-
 int
 machine_at_aptiva2168_init(const machine_t *model)
 {
@@ -1482,9 +1460,6 @@ machine_at_aptiva2168_init(const machine_t *model)
 
     if (gfxcard[0] == VID_INTERNAL)
         device_add(machine_get_vid_device(machine));
-
-    io_sethandler(0x00ea, 1, NULL, NULL, NULL, aptiva_board_write, NULL, NULL, NULL);
-    io_sethandler(0x00eb, 1, aptiva_board_read, NULL, NULL, NULL, NULL, NULL, NULL);
 
     return ret;
 }
