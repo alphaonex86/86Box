@@ -513,6 +513,11 @@ opF7_w_a32(uint32_t fetchdat)
     return 0;
 }
 
+/* 32-bit DIV/IDIV clocks: Intel P5 (Pentium datasheet) 41/46, 486 40/43, 386 38/43 */
+#define P5_DIVIDE    (is586 && cpu_isintel && !is_p6)
+#define DIVL_CLOCKS  (P5_DIVIDE ? 41 : (is486 ? 40 : 38))
+#define IDIVL_CLOCKS (P5_DIVIDE ? 46 : 43)
+
 static int
 opF7_l_a16(uint32_t fetchdat)
 {
@@ -589,16 +594,16 @@ opF7_l_a16(uint32_t fetchdat)
                 return 1;
             if (!cpu_iscyrix && !is6117)
                 setznp32(EAX); /*Not a Cyrix*/
-            CLOCK_CYCLES((is486) ? 40 : 38);
-            PREFETCH_RUN(is486 ? 40 : 38, 2, rmdat, 0, (cpu_mod == 3) ? 0 : 1, 0, 0, 0);
+            CLOCK_CYCLES(DIVL_CLOCKS);
+            PREFETCH_RUN(DIVL_CLOCKS, 2, rmdat, 0, (cpu_mod == 3) ? 0 : 1, 0, 0, 0);
             break;
         case 0x38: /*IDIV EAX,l*/
             if (idivl((int32_t) dst))
                 return 1;
             if (!cpu_iscyrix && !is6117)
                 setznp32(EAX); /*Not a Cyrix*/
-            CLOCK_CYCLES(43);
-            PREFETCH_RUN(43, 2, rmdat, 0, (cpu_mod == 3) ? 0 : 1, 0, 0, 0);
+            CLOCK_CYCLES(IDIVL_CLOCKS);
+            PREFETCH_RUN(IDIVL_CLOCKS, 2, rmdat, 0, (cpu_mod == 3) ? 0 : 1, 0, 0, 0);
             break;
 
         default:
@@ -682,16 +687,16 @@ opF7_l_a32(uint32_t fetchdat)
                 return 1;
             if (!cpu_iscyrix && !is6117)
                 setznp32(EAX); /*Not a Cyrix*/
-            CLOCK_CYCLES((is486) ? 40 : 38);
-            PREFETCH_RUN(is486 ? 40 : 38, 2, rmdat, 0, (cpu_mod == 3) ? 0 : 1, 0, 0, 1);
+            CLOCK_CYCLES(DIVL_CLOCKS);
+            PREFETCH_RUN(DIVL_CLOCKS, 2, rmdat, 0, (cpu_mod == 3) ? 0 : 1, 0, 0, 1);
             break;
         case 0x38: /*IDIV EAX,l*/
             if (idivl((int32_t) dst))
                 return 1;
             if (!cpu_iscyrix && !is6117)
                 setznp32(EAX); /*Not a Cyrix*/
-            CLOCK_CYCLES(43);
-            PREFETCH_RUN(43, 2, rmdat, 0, (cpu_mod == 3) ? 0 : 1, 0, 0, 1);
+            CLOCK_CYCLES(IDIVL_CLOCKS);
+            PREFETCH_RUN(IDIVL_CLOCKS, 2, rmdat, 0, (cpu_mod == 3) ? 0 : 1, 0, 0, 1);
             break;
 
         default:
