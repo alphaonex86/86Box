@@ -4555,3 +4555,17 @@ const device_t tgui9680_pci_device = {
     .force_redraw  = tgui_force_redraw,
     .config        = tgui96xx_config
 };
+
+const device_t tgui9680_onboard_pci_device = {
+    .name          = "Trident TGUI 9680XGi On-Board PCI",
+    .internal_name = "tgui9680_onboard_pci",
+    .flags         = DEVICE_PCI,
+    .local         = TGUI_9680 | ONBOARD,
+    .init          = tgui_init,
+    .close         = tgui_close,
+    .reset         = NULL,
+    .available     = NULL,
+    .speed_changed = tgui_speed_changed,
+    .force_redraw  = tgui_force_redraw,
+    .config        = tgui9440_config
+};
