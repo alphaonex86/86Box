@@ -266,6 +266,7 @@ enum {
     MACHINE_CHIPSET_OPTI_499,
     MACHINE_CHIPSET_OPTI_895_802G,
     MACHINE_CHIPSET_OPTI_547_597,
+    MACHINE_CHIPSET_OPTI_VIPER,
     MACHINE_CHIPSET_SARC_RC2016A,
     MACHINE_CHIPSET_SIS_310,
     MACHINE_CHIPSET_SIS_401,
@@ -1008,6 +1009,7 @@ extern int             machine_at_g586vpmc_init(const machine_t *);
 extern const device_t  p54tp4xe_device;
 #endif
 extern int             machine_at_p54tp4xe_init(const machine_t *);
+extern int             machine_at_aptiva2168_init(const machine_t *);
 extern int             machine_at_exp8551_init(const machine_t *);
 extern int             machine_at_holly_init(const machine_t *);
 #ifdef EMU_DEVICE_H
