@@ -49,6 +49,7 @@
 #include <86box/hdc_ide_sff8038i.h>
 #include <86box/dma.h>
 #include <86box/log.h>
+#include <86box/flash.h>
 
 #ifdef ENABLE_OPTI55X_LOG
 int opti55x_do_log = ENABLE_OPTI55X_LOG;
@@ -369,7 +370,8 @@ opti55x_sb_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
             dev->pci_conf_sb[addr] = val;
             break;
         case 0x52 ... 0x53: /* 82C558M Interrupt Multiplexing Control Register */
-            dev->pci_conf_sb[addr] = val;
+            /* 53h bit 1, locking of flash ROM: once set, writes stay blocked until reset. */
+            dev->pci_conf_sb[addr] = val | ((addr == 0x53) ? (dev->pci_conf_sb[addr] & 0x02) : 0x00);
             break;
         case 0x54 ... 0x55: /* 82C558M DMA Control Register */
             dev->pci_conf_sb[addr] = val;
@@ -945,6 +947,40 @@ opti55x_ide_readw(uint16_t addr, void *priv)
     return ret;
 }
 
+/* ROMCS# at 4 GB, 4Bh: FFFF0000-FFFFFFFF (bits 7-6) decoded unless set, FFFC0000-FFFEFFFF (bits 5-0) when set,
+   32 KB each. The E and F segments (4Ah) are left to the shadow logic. */
+static int
+opti55x_bios_read_gate(uint32_t addr, void *priv)
+{
+    const opti55x_t *dev = (opti55x_t *) priv;
+    int              bit;
+
+    if (addr < 0xfffc0000)
+        return 1;
+
+    bit = (addr >> 15) & 0x07;
+    return !!(dev->pci_conf_sb[0x4b] & (1 << bit)) == (bit < 6);
+}
+
+/* ROMCS# on writes: 47h bit 7, and not locked (53h bit 1); at 4 GB only where decoded, in the E and F segments
+   where 4Ah decodes them (E0000-EFFFF bits 5-4 set, F0000-FFFFF bits 7-6 clear). */
+static int
+opti55x_bios_write_gate(uint32_t addr, void *priv)
+{
+    const opti55x_t *dev = (opti55x_t *) priv;
+    int              bit;
+
+    if (!(dev->pci_conf_sb[0x47] & 0x80) || (dev->pci_conf_sb[0x53] & 0x02))
+        return 0;
+
+    if ((addr >= 0x000e0000) && (addr < 0x00100000)) {
+        bit = 4 + ((addr >> 15) & 0x03);
+        return !!(dev->pci_conf_sb[0x4a] & (1 << bit)) == (bit < 6);
+    }
+
+    return opti55x_bios_read_gate(addr, priv);
+}
+
 static void
 opti55x_reset(void *priv)
 {
@@ -970,6 +1006,10 @@ opti55x_reset(void *priv)
     dev->pci_conf_sb[0x0a] = 0x01;
     dev->pci_conf_sb[0x0b] = 0x06;
     dev->pci_conf_sb[0x4f] = 0x40; /* 82C558M Rev 1 */
+    dev->pci_conf_sb[0x47] &= 0x7f;
+    dev->pci_conf_sb[0x4a] = 0x00;
+    dev->pci_conf_sb[0x4b] = 0x00;
+    dev->pci_conf_sb[0x53] &= 0xfd;
 
     dev->pci_conf_ide[0x00] = 0x45;
     dev->pci_conf_ide[0x01] = 0x10;
@@ -1013,6 +1053,15 @@ opti55x_close(void *priv)
     opti55x_t *dev = (opti55x_t *) priv;
 
     smram_del(dev->smram);
+
+    if (flash_bios_write_gate_priv == dev) {
+        flash_bios_write_gate      = NULL;
+        flash_bios_write_gate_priv = NULL;
+    }
+    if (flash_bios_read_gate_priv == dev) {
+        flash_bios_read_gate      = NULL;
+        flash_bios_read_gate_priv = NULL;
+    }
 
     if (dev->log != NULL) {
         log_close(dev->log);
@@ -1065,6 +1114,11 @@ opti55x_init(const device_t *info)
     dma_high_page_init();
 
     opti55x_reset(dev);
+
+    flash_bios_write_gate      = opti55x_bios_write_gate;
+    flash_bios_write_gate_priv = dev;
+    flash_bios_read_gate       = opti55x_bios_read_gate;
+    flash_bios_read_gate_priv  = dev;
 
     return dev;
 }
