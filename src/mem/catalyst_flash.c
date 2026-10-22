@@ -6,8 +6,8 @@
  *
  *          This file is part of the 86Box distribution.
  *
- *          Implementation of the Intel 1 Mbit and 2 Mbit, 8-bit and
- *          16-bit flash devices.
+ *          Implementation of the 28F010 family of 1 Mbit 12 V flash
+ *          devices (Intel 28F010, AMD Am28F010, Catalyst CAT28F010).
  *
  * Authors: Sarah Walker, <https://pcem-emulator.co.uk/>
  *          Miran Grca, <mgrca8@gmail.com>
@@ -27,39 +27,35 @@
 #include <86box/timer.h>
 #include <86box/nvr.h>
 #include <86box/plat.h>
-#include <86box/plat_fallthrough.h>
 #include <86box/flash.h>
 
-#define FLAG_WORD    4
-#define FLAG_BXB     2
-#define FLAG_INV_A16 1
-
+/* The command register of the 28F010 (Intel 290207, AMD Am28F010, Catalyst CAT28F010): a write in a set-up state
+   is the operation's data, any other write is a command. Program and erase only start on the set-up's second write;
+   the next command (C0h/A0h verify) ends them. Programming clears bits only. Without 12 V on VPP the register is
+   disabled: the chip reads its array and ignores every write. */
 enum {
-    BLOCK_MAIN1,
-    BLOCK_MAIN2,
-    BLOCK_DATA1,
-    BLOCK_DATA2,
-    BLOCK_BOOT,
-    BLOCKS_NUM
+    CMD_READ           = 0x00,
+    CMD_READ_ID        = 0x90,
+    CMD_READ_ID_ALT    = 0x80,
+    CMD_ERASE          = 0x20,
+    CMD_ERASE_VERIFY   = 0xa0,
+    CMD_PROGRAM        = 0x40,
+    CMD_PROGRAM_VERIFY = 0xc0,
+    CMD_RESET          = 0xff
 };
 
 enum {
-    CMD_SET_READ         = 0x00,
-    CMD_READ_AUTO_SELECT = 0x80,
-    CMD_READ_SIGNATURE   = 0x90,
-    CMD_ERASE            = 0x20,
-    CMD_ERASE_CONFIRM    = 0x20,
-    CMD_ERASE_VERIFY     = 0xA0,
-    CMD_PROGRAM          = 0x40,
-    CMD_PROGRAM_VERIFY   = 0xC0,
-    CMD_RESET            = 0xFF
+    STATE_READ,
+    STATE_ID,
+    STATE_ERASE_SETUP,
+    STATE_PROGRAM_SETUP,
+    STATE_BUSY
 };
 
 typedef struct flash_t {
-    uint8_t command;
-    uint8_t is_amd;
-    uint8_t dirty;
-    uint8_t pad;
+    uint8_t  state;
+    uint8_t  dirty;
+    uint16_t id;
     uint8_t *array;
 
     mem_mapping_t mapping;
@@ -68,80 +64,40 @@ typedef struct flash_t {
 
 static char flash_path[1024];
 
+/* Board signal VPP: BOX86_FLASH_VPP=5 (jumper at 5 V) leaves the chip read-only. */
+static int
+flash_vpp_low(void)
+{
+    const char *v = getenv("BOX86_FLASH_VPP");
+    return v && !strcmp(v, "5");
+}
+
 static uint8_t
 flash_read(uint32_t addr, void *priv)
 {
     const flash_t *dev = (flash_t *) priv;
-    uint8_t        ret = 0xff;
 
     if (!flash_bios_read_selected(addr))
         return 0xff;
 
     addr &= biosmask;
 
-    switch (dev->command) {
-        case CMD_ERASE_VERIFY:
-        case CMD_PROGRAM_VERIFY:
-        case CMD_RESET:
-        case CMD_SET_READ:
-            ret = dev->array[addr];
-            break;
+    if (dev->state == STATE_ID)
+        return (addr & 1) ? (dev->id & 0xff) : (dev->id >> 8);
 
-        case CMD_READ_AUTO_SELECT:
-            if (!dev->is_amd)
-                break;
-            fallthrough;
-        case CMD_READ_SIGNATURE:
-            if (dev->is_amd) {
-                if (addr == 0x00000)
-                    ret = 0x01; /* AMD */
-                else if (addr == 0x00001)
-                    ret = 0xa7; /* Am28F010 */
-            } else {
-                if (addr == 0x00000)
-                    ret = 0x31; /* CATALYST */
-                else if (addr == 0x00001)
-                    ret = 0xb4; /* 28F010 */
-            }
-            break;
-
-        default:
-            break;
-    }
-
-    return ret;
+    return dev->array[addr];
 }
 
 static uint16_t
 flash_readw(uint32_t addr, void *priv)
 {
-    flash_t        *dev = (flash_t *) priv;
-    const uint16_t *q;
-
-    if (!flash_bios_read_selected(addr))
-        return 0xffff;
-
-    addr &= biosmask;
-
-    q = (uint16_t *) &(dev->array[addr]);
-
-    return *q;
+    return flash_read(addr, priv) | (flash_read(addr + 1, priv) << 8);
 }
 
 static uint32_t
 flash_readl(uint32_t addr, void *priv)
 {
-    flash_t        *dev = (flash_t *) priv;
-    const uint32_t *q;
-
-    if (!flash_bios_read_selected(addr))
-        return 0xffffffff;
-
-    addr &= biosmask;
-
-    q = (uint32_t *) &(dev->array[addr]);
-
-    return *q;
+    return flash_readw(addr, priv) | (flash_readw(addr + 2, priv) << 16);
 }
 
 static void
@@ -149,40 +105,66 @@ flash_write(uint32_t addr, uint8_t val, void *priv)
 {
     flash_t *dev = (flash_t *) priv;
 
-    if (!flash_bios_write_selected(addr))
+    if (!flash_bios_write_selected(addr) || flash_vpp_low())
         return;
 
     addr &= biosmask;
 
-    switch (dev->command) {
-        case CMD_ERASE:
-            if (val == CMD_ERASE_CONFIRM) {
+    switch (dev->state) {
+        case STATE_ERASE_SETUP:
+            if (val == CMD_ERASE) {
                 memset(dev->array, 0xff, biosmask + 1);
                 dev->dirty = 1;
-            }
+                dev->state = STATE_BUSY;
+            } else
+                dev->state = STATE_READ;
             break;
 
-        case CMD_PROGRAM:
-            dev->array[addr] = val;
-            dev->dirty = 1;
+        case STATE_PROGRAM_SETUP:
+            if ((dev->array[addr] & val) != dev->array[addr]) {
+                dev->array[addr] &= val;
+                dev->dirty = 1;
+            }
+            dev->state = STATE_BUSY;
             break;
 
         default:
-            dev->command = val;
+            switch (val) {
+                case CMD_READ:
+                case CMD_RESET:
+                case CMD_ERASE_VERIFY:
+                case CMD_PROGRAM_VERIFY:
+                    dev->state = STATE_READ;
+                    break;
+                case CMD_READ_ID:
+                case CMD_READ_ID_ALT:
+                    dev->state = STATE_ID;
+                    break;
+                case CMD_ERASE:
+                    dev->state = STATE_ERASE_SETUP;
+                    break;
+                case CMD_PROGRAM:
+                    dev->state = STATE_PROGRAM_SETUP;
+                    break;
+                default:
+                    break;
+            }
             break;
     }
 }
 
 static void
-flash_writew(UNUSED(uint32_t addr), UNUSED(uint16_t val), UNUSED(void *priv))
+flash_writew(uint32_t addr, uint16_t val, void *priv)
 {
-    //
+    flash_write(addr, val & 0xff, priv);
+    flash_write(addr + 1, val >> 8, priv);
 }
 
 static void
-flash_writel(UNUSED(uint32_t addr), UNUSED(uint32_t val), UNUSED(void *priv))
+flash_writel(uint32_t addr, uint32_t val, void *priv)
 {
-    //
+    flash_writew(addr, val & 0xffff, priv);
+    flash_writew(addr + 2, val >> 16, priv);
 }
 
 static void
@@ -210,11 +192,11 @@ catalyst_flash_reset(void *priv)
 {
     flash_t *dev = (flash_t *) priv;
 
-    dev->command = CMD_RESET;
+    dev->state = STATE_READ;
 }
 
 static void *
-catalyst_flash_init(UNUSED(const device_t *info))
+catalyst_flash_init(const device_t *info)
 {
     FILE    *fp;
     flash_t *dev;
@@ -231,8 +213,8 @@ catalyst_flash_init(UNUSED(const device_t *info))
 
     catalyst_flash_add_mappings(dev);
 
-    dev->command = CMD_RESET;
-    dev->is_amd  = info->local;
+    dev->state = STATE_READ;
+    dev->id    = info->local;
 
     if (strlen(flash_path) > 0) {
         fp = nvr_fopen(flash_path, "rb");
@@ -277,7 +259,7 @@ const device_t catalyst_flash_device = {
     .name          = "Catalyst 28F010-D Flash BIOS",
     .internal_name = "catalyst_flash",
     .flags         = DEVICE_PCI,
-    .local         = 0,
+    .local         = 0x31b4,
     .init          = catalyst_flash_init,
     .close         = catalyst_flash_close,
     .reset         = catalyst_flash_reset,
@@ -291,7 +273,21 @@ const device_t amd_am28f010_flash_device = {
     .name          = "AMD Am28F010-D Flash BIOS",
     .internal_name = "amd_am28f010_flash",
     .flags         = DEVICE_PCI,
-    .local         = 1,
+    .local         = 0x01a7,
+    .init          = catalyst_flash_init,
+    .close         = catalyst_flash_close,
+    .reset         = catalyst_flash_reset,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = NULL
+};
+
+const device_t intel_28f010_flash_device = {
+    .name          = "Intel 28F010 Flash BIOS",
+    .internal_name = "intel_28f010_flash",
+    .flags         = DEVICE_PCI,
+    .local         = 0x89b4,
     .init          = catalyst_flash_init,
     .close         = catalyst_flash_close,
     .reset         = catalyst_flash_reset,

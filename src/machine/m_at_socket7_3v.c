@@ -1435,7 +1435,8 @@ machine_at_gw2kma_init(const machine_t *model)
 int
 machine_at_aptiva2168_init(const machine_t *model)
 {
-    int ret;
+    const char *flash;
+    int         ret;
 
     ret = bios_load_linear("roms/machines/aptiva2168/BG2US0J.BIN",
                            0x000e0000, 131072, 0);
@@ -1456,7 +1457,9 @@ machine_at_aptiva2168_init(const machine_t *model)
 
     device_add(&opti55x_device);
     device_add_params(&fdc37c93x_device, (void *) (FDC37XXX3 | FDC37C93X_NORMAL));
-    device_add(&amd_am28f010_flash_device);
+    /* BOX86_FLASH=tn28f010: the operator's Intel TN28F010 in place of the IBM MX28F1000 (an AMD 28F010 here). */
+    flash = getenv("BOX86_FLASH");
+    device_add((flash && !strcmp(flash, "tn28f010")) ? &intel_28f010_flash_device : &amd_am28f010_flash_device);
 
     if (gfxcard[0] == VID_INTERNAL)
         device_add(machine_get_vid_device(machine));
