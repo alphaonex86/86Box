@@ -94,6 +94,7 @@ machine_init_ex(int m)
 
         /* Reset the memory state. */
         mem_reset();
+        cpu_car_init();
         smbase = is_am486dxl ? 0x00060000 : 0x00030000;
 
         if (cassette_enable)

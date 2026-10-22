@@ -23,6 +23,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 
@@ -2604,6 +2605,85 @@ cpu_CPUID(void)
     }
 }
 
+/* Firmware cache-as-RAM on a P6 (coreboot cpu/intel/car/p3): a write-back variable MTRR over addresses with no
+   memory behind them keeps data in the cache. 86Box has no cache model, so such a range (512 KiB at most, the
+   cache's size) gets RAM of its own while the MTRR lasts. */
+#define CAR_MAX (512 * 1024)
+
+static mem_mapping_t car_mapping[8];
+static uint8_t      *car_ram[8];
+
+static uint8_t
+car_read_b(uint32_t addr, void *priv)
+{
+    return ((uint8_t *) priv)[addr & (CAR_MAX - 1)];
+}
+
+static uint16_t
+car_read_w(uint32_t addr, void *priv)
+{
+    return car_read_b(addr, priv) | (car_read_b(addr + 1, priv) << 8);
+}
+
+static uint32_t
+car_read_l(uint32_t addr, void *priv)
+{
+    return car_read_w(addr, priv) | ((uint32_t) car_read_w(addr + 2, priv) << 16);
+}
+
+static void
+car_write_b(uint32_t addr, uint8_t val, void *priv)
+{
+    ((uint8_t *) priv)[addr & (CAR_MAX - 1)] = val;
+}
+
+static void
+car_write_w(uint32_t addr, uint16_t val, void *priv)
+{
+    car_write_b(addr, val, priv);
+    car_write_b(addr + 1, val >> 8, priv);
+}
+
+static void
+car_write_l(uint32_t addr, uint32_t val, void *priv)
+{
+    car_write_w(addr, val, priv);
+    car_write_w(addr + 2, val >> 16, priv);
+}
+
+/* After mem_reset(): the mappings join the new mapping list, disabled. */
+void
+cpu_car_init(void)
+{
+    for (int i = 0; i < 8; i++) {
+        if (!car_ram[i] && !(car_ram[i] = calloc(1, CAR_MAX)))
+            fatal("cpu_car_init(): out of memory\n");
+        mem_mapping_add(&car_mapping[i], 0, 0, car_read_b, car_read_w, car_read_l,
+                        car_write_b, car_write_w, car_write_l, NULL, MEM_MAPPING_EXTERNAL, car_ram[i]);
+        mem_mapping_disable(&car_mapping[i]);
+    }
+}
+
+/* Each variable MTRR that is valid, write-back, at most CAR_MAX and above the installed RAM maps its range. */
+void
+cpu_car_update(void)
+{
+    for (int i = 0; i < 8; i++) {
+        const uint64_t base  = msr.mtrr_physbase[i];
+        const uint64_t mask  = msr.mtrr_physmask[i];
+        const uint64_t start = base & 0xffffff000ULL;
+        const uint64_t size  = ((~mask) & 0xffffff000ULL) + 0x1000;
+        const int      on    = (msr.mtrr_deftype & 0x800) && (mask & 0x800) && ((base & 0xff) == 6) &&
+                               (size <= CAR_MAX) && (start >= ((uint64_t) mem_size << 10)) &&
+                               (start + size <= 0x100000000ULL);
+
+        if (on && (!car_mapping[i].enable || (car_mapping[i].base != start) || (car_mapping[i].size != size)))
+            mem_mapping_set_addr(&car_mapping[i], (uint32_t) start, (uint32_t) size);
+        else if (!on && car_mapping[i].enable)
+            mem_mapping_disable(&car_mapping[i]);
+    }
+}
+
 void
 cpu_ven_reset(void)
 {
@@ -2669,6 +2749,8 @@ cpu_ven_reset(void)
                       (1 << 20) | (1 << 21);
             break;
     }
+
+    cpu_car_update();
 }
 
 void
@@ -4171,6 +4253,7 @@ pentium_invalid_wrmsr:
                         msr.mtrr_physmask[(ECX - 0x200) >> 1] = EAX | ((uint64_t) EDX << 32);
                     else
                         msr.mtrr_physbase[(ECX - 0x200) >> 1] = EAX | ((uint64_t) EDX << 32);
+                    cpu_car_update();
                     break;
                 /* MTRRfix64K_00000 */
                 case 0x250:
@@ -4202,6 +4285,7 @@ pentium_invalid_wrmsr:
                 /* MTRRdefType */
                 case 0x2ff:
                     msr.mtrr_deftype = EAX | ((uint64_t) EDX << 32);
+                    cpu_car_update();
                     break;
                 /* MC0_CTL - Machine Check 0 Control */
                 case 0x400:

@@ -753,6 +753,8 @@ extern int  cpu_alt_reset;
 extern void cpu_dynamic_switch(int new_cpu);
 
 extern void cpu_ven_reset(void);
+extern void cpu_car_init(void);
+extern void cpu_car_update(void);
 extern void update_tsc(void);
 
 extern int sysenter(uint32_t fetchdat);
