@@ -123,7 +123,7 @@ text_dump(const char *path)
     rename(tmp, path);
 }
 
-/* BOX86_LIST_VIDEO=<file>: the video cards valid on the configured machine, one per line
+/* BOX86_LIST_VIDEO=<file>: the video cards (bus cards) valid on the configured machine, one per line
    "<internal name>|<isa|pci>|<mono|color>|<config section>|<memory option: default, then each value=description>",
    then exit. */
 static void
@@ -136,8 +136,8 @@ list_video(const char *path)
     }
     for (int c = 2; video_card_getdevice(c); c++) {
         const device_t *dev = video_card_getdevice(c);
-        if (!video_card_available(c) || !device_is_valid(dev, machine))
-            continue;
+        if (!video_card_available(c) || !device_is_valid(dev, machine) || !(dev->flags & DEVICE_BUS))
+            continue;   /* not a bus card: "external" (no device), the HD44780 LCD (parallel port) */
         fprintf(fp, "%s|%s|%s|%s|", dev->internal_name, (dev->flags & DEVICE_PCI) ? "pci" : "isa",
                 (video_card_get_flags(c) & VIDEO_FLAG_TYPE_MASK) == VIDEO_FLAG_TYPE_MDA ? "mono" : "color", dev->name);
         for (const device_config_t *cfg = dev->config; cfg && cfg->type != CONFIG_END; cfg++) {
