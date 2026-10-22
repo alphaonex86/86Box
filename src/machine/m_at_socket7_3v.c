@@ -40,6 +40,7 @@
 #include <86box/nvr.h>
 #include <86box/plat_unused.h>
 #include <86box/sound.h>
+#include <86box/usb_uhci.h>
 
 /* i430FX */
 static const device_config_t p54tp4xe_config[] = {
@@ -1460,6 +1461,9 @@ machine_at_aptiva2168_init(const machine_t *model)
     /* BOX86_FLASH=tn28f010: the operator's Intel TN28F010 in place of the IBM MX28F1000 (an AMD 28F010 here). */
     flash = getenv("BOX86_FLASH");
     device_add((flash && !strcmp(flash, "tn28f010")) ? &intel_28f010_flash_device : &amd_am28f010_flash_device);
+    /* The operator's VIA USB card, for tests: BOX86_USB, BOX86_USB_KBD (keyboard), BOX86_USB_DISK (image) */
+    if (getenv("BOX86_USB") || getenv("BOX86_USB_KBD") || getenv("BOX86_USB_DISK"))
+        device_add(&usb_uhci_via_device);
 
     if (gfxcard[0] == VID_INTERNAL)
         device_add(machine_get_vid_device(machine));
