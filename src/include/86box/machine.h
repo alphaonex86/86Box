@@ -1169,6 +1169,7 @@ extern int             machine_at_op47_init(const machine_t *);
 extern int             machine_at_gw2kma_init(const machine_t *);
 
 /* OPTi Viper */
+extern int             machine_at_aptiva2168_init(const machine_t *);
 extern int             machine_at_rhino8_init(const machine_t *);
 
 /* SiS 5501 */

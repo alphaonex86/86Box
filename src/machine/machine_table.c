@@ -18408,6 +18408,55 @@ const machine_t machines[] = {
     },
 
     /* OPTi Viper */
+    /* IBM Aptiva 2144/2168 Type I-2 system board: OPTi Viper-M, SMC FDC37C933,
+       onboard Trident TGUI9680XGi, IBM BIOS (BG2). */
+    {
+        .name              = "[OPTi Viper] IBM Aptiva 2168 (Type I-2)",
+        .internal_name     = "aptiva2168",
+        .type              = MACHINE_TYPE_SOCKET7_3V,
+        .chipset           = MACHINE_CHIPSET_OPTI_VIPER,
+        .init              = machine_at_aptiva2168_init,
+        .p1_handler        = machine_generic_p1_handler,
+        .gpio_handler      = NULL,
+        .available_flag    = MACHINE_AVAILABLE,
+        .gpio_acpi_handler = NULL,
+        .cpu               = {
+            .package     = CPU_PKG_SOCKET5_7,
+            .block       = CPU_BLOCK_NONE,
+            .min_bus     = 50000000,
+            .max_bus     = 66666667,
+            .min_voltage = 3380,
+            .max_voltage = 3520,
+            .min_multi   = 1.5,
+            .max_multi   = 2.5
+        },
+        .bus_flags = MACHINE_PS2_PCI,
+        .flags     = MACHINE_IDE_DUAL | MACHINE_VIDEO | MACHINE_APM,
+        .ram       = {
+            .min  = 8192,
+            .max  = 131072,
+            .step = 8192
+        },
+        .nvrmask                  = 255,
+        .jumpered_ecp_dma         = 0,
+        .default_jumpered_ecp_dma = -1,
+        .kbc_device               = NULL,
+        .kbc_params               = 0x00000000,
+        .nvr_device               = NULL,
+        .nvr_params               = 0x00000000,
+        .sio_device               = NULL,
+        .sio_params               = 0x00000000,
+        .kbc_p1                   = 0x00000cf0,
+        .gpio                     = 0xffffffff,
+        .gpio_acpi                = 0xffffffff,
+        .device                   = NULL,
+        .kbd_device               = NULL,
+        .fdc_device               = NULL,
+        .vid_device               = &tgui9680_onboard_pci_device,
+        .snd_device               = NULL,
+        .net_device               = NULL,
+        .aliases                  = { "Aptiva A90", "Aptiva 2144", "" }
+    },
     /* Has VIA KBC firmware */
     {
         .name              = "[OPTi Viper] Octek Rhino 8",
