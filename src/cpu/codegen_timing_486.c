@@ -300,6 +300,7 @@ static int *opcode_timings_486_81_mod3[8] = {
 static int      timing_count;
 static uint8_t  last_prefix;
 static uint32_t regmask_modified;
+static int      last_jcc;
 
 static inline int
 COUNT(int *c, int op_32)
@@ -438,6 +439,7 @@ codegen_timing_486_opcode(uint8_t opcode, uint32_t fetchdat, int op_32, UNUSED(u
             }
     }
 
+    last_jcc = (last_prefix == 0x0f) ? ((opcode & 0xf0) == 0x80) : ((opcode & 0xf0) == 0x70);
     timing_count += COUNT(timings[opcode], op_32);
     if (regmask_modified & get_addr_regmask(deps[opcode], fetchdat, op_32))
         timing_count++; /*AGI stall*/
@@ -452,11 +454,19 @@ codegen_timing_486_block_end(void)
     //
 }
 
+/* A Jcc is charged timing_bnt above; taken, it takes timing_bt more, as in the
+   interpreter (opJ*). */
+static int
+codegen_timing_486_jump_cycles(void)
+{
+    return last_jcc ? timing_bt : 0;
+}
+
 codegen_timing_t codegen_timing_486 = {
     codegen_timing_486_start,
     codegen_timing_486_prefix,
     codegen_timing_486_opcode,
     codegen_timing_486_block_start,
     codegen_timing_486_block_end,
-    NULL
+    codegen_timing_486_jump_cycles
 };
