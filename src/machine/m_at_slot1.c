@@ -1899,6 +1899,9 @@ machine_at_p3bf_init(const machine_t *model)
     if (bios_only || !ret)
         return ret;
 
+    /* coreboot (the firmware tests' replacement ROM) keeps its stack and data in the cache before DRAM is up. */
+    cpu_car_enable();
+
     machine_at_common_init(model);
 
     pci_init(PCI_CONFIG_TYPE_1);
