@@ -4,10 +4,12 @@
  *   key <hex>...   press and release each key (set 1 scan codes, 0x1xx = E0 prefixed)
  *   combo <hex>... press the keys together, then release them (e.g. 1d 38 53: Ctrl+Alt+Del)
  *   usbkey <hex>.. type on the USB keyboard: modifiers << 8 | HID usage each (e.g. 4c: Del, 054c: Ctrl+Alt+Del)
- *   text <file>    write the 80x25 text screen at B8000 to <file> (atomic rename)
+ *   text <file>    write the 80x25 text screen at B8000 to <file> (atomic rename), from the VGA CRTC start address
  *   pci <file>     write the config space of every bus 0 PCI function to <file> (atomic rename)
  *   out <port> <v> write byte <v> to I/O <port> (hex)
  *   in <port> <f>  append "<port> <value>" (hex) read from I/O <port> to file <f>
+ *   idx <p> <d> <i> <f> append "<i> <value>" (hex) of an indexed register: <i> written to I/O <p>, then <d> read,
+ *                  with no CPU code in between (e.g. 22 24 13: the 82C557M's index 13h)
  *   shot           save a PNG of the screen in <vm path>/screenshots/ at the next frame
  *   cr0 <file>     append CR0 (hex) to <file>
  *   flash <file>   append "<instructions fetched> <bytes read>" from the BIOS flash since the last flash command
@@ -112,9 +114,18 @@ text_dump(const char *path)
     FILE *fp = open_tmp(path, tmp);
     if (!fp)
         return;
+    uint8_t  index = inb(0x3d4);
+    uint32_t start = 0;
+    outb(0x3d4, 0x0c);
+    if (inb(0x3d4) == 0x0c) { /* a readable index: VGA, not CGA/EGA */
+        start = inb(0x3d5) << 9;
+        outb(0x3d4, 0x0d);
+        start |= inb(0x3d5) << 1;
+    }
+    outb(0x3d4, index);
     for (int row = 0; row < 25; row++) {
         for (int col = 0; col < 80; col++) {
-            uint8_t c = mem_readb_phys(0xb8000 + 2 * (row * 80 + col));
+            uint8_t c = mem_readb_phys(0xb8000 + ((start + 2 * (row * 80 + col)) & 0x7fff));
             fputc((c >= 0x20 && c < 0x7f) ? c : ' ', fp);
         }
         fputc('\n', fp);
@@ -224,8 +235,16 @@ testctl_poll(void)
             fprintf(fp, "%03x %02x\n", port, inb(port));
             fclose(fp);
         }
-    }
-    else if (!strcmp(cmd, "cr0")) {
+    } else if (!strcmp(cmd, "idx")) {
+        unsigned port, data, index;
+        char     file[CMD_MAX];
+        FILE    *fp;
+        if (sscanf(arg, "%x %x %x %1023s", &port, &data, &index, file) == 4 && (fp = fopen(file, "a"))) {
+            outb(port, index);
+            fprintf(fp, "%02x %02x\n", index, inb(data));
+            fclose(fp);
+        }
+    } else if (!strcmp(cmd, "cr0")) {
         FILE *fp = fopen(arg, "a");
         if (fp) {
             fprintf(fp, "%08x\n", cr0);
