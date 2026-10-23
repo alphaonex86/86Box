@@ -1368,8 +1368,8 @@ tgui_pci_read(UNUSED(int func), int addr, UNUSED(int len), void *priv)
         case 0x09:
             return 0; /*Programming interface*/
 
-        case 0x0a:
-            return 0x01; /*Supports VGA interface, XGA compatible*/
+        case 0x0a: /*TGUI96x0: VGA, as the PCI data of its BIOS (030000); else VGA interface, XGA compatible*/
+            return (tgui->type >= TGUI_9660) ? 0x00 : 0x01;
         case 0x0b:
             return 0x03;
 
