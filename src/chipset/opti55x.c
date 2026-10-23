@@ -417,7 +417,8 @@ opti55x_dram_update(opti55x_t *dev)
             /* PCI memory may sit between the RAM top and the 86Box RAM size */
             mem_set_mem_state_both(0x100000, dev->top - 0x100000, MEM_READ_INTERNAL | MEM_WRITE_INTERNAL);
             mem_set_mem_state_both(dev->top, mem_size * 1024 - dev->top, MEM_READ_EXTERNAL | MEM_WRITE_EXTERNAL);
-        }
+        } else /* the decode handlers again above the old top (a CPU-only reset sizes the DRAM anew) */
+            mem_set_mem_state_both(0x100000, mem_size * 1024 - 0x100000, MEM_READ_INTERNAL | MEM_WRITE_INTERNAL);
     } else if (!flat || (overlay == dev->overlay))
         return;
     dev->overlay = overlay;
