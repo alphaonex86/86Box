@@ -50,6 +50,7 @@
 #include <86box/dma.h>
 #include <86box/log.h>
 #include <86box/flash.h>
+#include <86box/cache_l1.h>
 
 #ifdef ENABLE_OPTI55X_LOG
 int opti55x_do_log = ENABLE_OPTI55X_LOG;
@@ -119,8 +120,10 @@ typedef struct opti55x_t {
     opti55x_simm_t simm[2];
     uint8_t       *simm_data;
     uint8_t        dram_regs[4]; /* 00h (82C546/547 mode only), 13h, 14h, 19h: the decode bits */
+    uint32_t       top;          /* of the banks programmed */
     int            flat;         /* one-to-one decode: data in 86Box RAM below flat_top, laid out by flat_regs;
                                     -1 before the first reset */
+    int            overlay;      /* opti55x_ram_* handlers in front of the flat RAM: cache-as-RAM */
     uint32_t       flat_top;
     uint8_t        flat_regs[4];
     mem_mapping_t  low_mapping;
@@ -128,6 +131,7 @@ typedef struct opti55x_t {
     uint32_t       stuck_addr;   /* fault injection: this byte reads bit stuck_mask as 0; 0: none */
     uint8_t        stuck_mask;
     mem_mapping_t  stuck_mapping;
+    cache_l1_t     l1;           /* the P54C's data cache, for cache-as-RAM */
 
     void *      log; /* New logging system */
 } opti55x_t;
@@ -262,9 +266,9 @@ opti55x_dram_flat(const opti55x_t *dev, const uint8_t *regs, uint32_t *top)
     return flat && (*top >= 0x100000) && (*top <= mem_size * 1024);
 }
 
-/* DRAM: flat RAM or SIMM cells; unanswered reads float high. */
+/* DRAM behind the CPU's L1: flat RAM or SIMM cells; unanswered reads float high. */
 static uint8_t
-opti55x_ram_readb(uint32_t addr, void *priv)
+opti55x_dram_load(void *priv, uint32_t addr)
 {
     const opti55x_t *dev = (opti55x_t *) priv;
 
@@ -272,6 +276,49 @@ opti55x_ram_readb(uint32_t addr, void *priv)
         return (addr < dev->flat_top) ? ram[addr] : 0xff;
     int64_t offset = opti55x_dram_decode(dev, dev->dram_regs, addr);
     return (offset < 0) ? 0xff : dev->simm_data[offset];
+}
+
+static void
+opti55x_dram_store(void *priv, uint32_t addr, uint8_t val)
+{
+    opti55x_t *dev = (opti55x_t *) priv;
+
+    if (dev->flat) {
+        if (addr < dev->flat_top)
+            mem_write_ramb_page(addr, val, &pages[addr >> 12]); /* tracks code pages */
+        return;
+    }
+    int64_t offset = opti55x_dram_decode(dev, dev->dram_regs, addr);
+    if (offset >= 0)
+        dev->simm_data[offset] = val;
+}
+
+/* KEN# and WB/WT# for an L1 line fill: the banks programmed, without the 80000h-9FFFFh hole (06h bit 7) and DRAM
+   holes A/B (09h-0Ch) that are not cacheable; write-back with 08h bit 1, except in a write-through hole. */
+static int
+opti55x_l1_fill(void *priv, uint32_t addr)
+{
+    const opti55x_t *dev = (opti55x_t *) priv;
+    int              wb  = dev->regs[0x08] & 0x02;
+
+    if ((addr >= dev->top) || ((dev->regs[0x06] & 0x80) && (addr >= 0x80000) && (addr < 0xa0000)))
+        return CACHE_L1_UNCACHED;
+    for (int hole = 0; hole < 2; hole++) {
+        uint8_t  ctl   = dev->regs[0x09] >> (4 * hole);
+        uint32_t start = (dev->regs[0x0a + hole] | (((dev->regs[0x0c] >> (2 * hole)) & 3) << 8)) << 19;
+        if ((ctl & 3) && (addr - start < (0x80000u << ((ctl >> 2) & 3)))) {
+            if ((ctl & 3) != 1)
+                return CACHE_L1_UNCACHED;
+            wb = 0;
+        }
+    }
+    return wb ? CACHE_L1_WB : CACHE_L1_WT;
+}
+
+static uint8_t
+opti55x_ram_readb(uint32_t addr, void *priv)
+{
+    return cache_l1_read(&((opti55x_t *) priv)->l1, addr);
 }
 
 static uint16_t
@@ -289,16 +336,7 @@ opti55x_ram_readl(uint32_t addr, void *priv)
 static void
 opti55x_ram_writeb(uint32_t addr, uint8_t val, void *priv)
 {
-    opti55x_t *dev = (opti55x_t *) priv;
-
-    if (dev->flat) {
-        if (addr < dev->flat_top)
-            mem_write_ramb_page(addr, val, &pages[addr >> 12]); /* tracks code pages */
-        return;
-    }
-    int64_t offset = opti55x_dram_decode(dev, dev->dram_regs, addr);
-    if (offset >= 0)
-        dev->simm_data[offset] = val;
+    cache_l1_write(&((opti55x_t *) priv)->l1, addr, val);
 }
 
 static void
@@ -360,40 +398,63 @@ static void
 opti55x_dram_update(opti55x_t *dev)
 {
     uint8_t *regs = dev->dram_regs;
-    uint32_t top;
 
     regs[0] = (dev->regs[0x13] & 0x80) ? 0x00 : (dev->regs[0x00] & 0x1f);
     regs[1] = dev->regs[0x13] & 0xf7; /* without the SMRAM bits */
     regs[2] = dev->regs[0x14] & 0x77;
     regs[3] = dev->regs[0x19];
-    int flat = opti55x_dram_flat(dev, regs, &top);
+    int flat    = opti55x_dram_flat(dev, regs, &dev->top);
+    int overlay = cache_l1_active(&dev->l1);
 
-    if ((flat == dev->flat) && (!flat || !memcmp(regs, dev->flat_regs, 4)))
+    if ((flat != dev->flat) || (flat && memcmp(regs, dev->flat_regs, 4))) {
+        if (dev->flat > 0)
+            opti55x_ram_copy(dev, dev->flat_regs, dev->flat_top, 0);
+        dev->flat = flat;
+        if (flat) {
+            memcpy(dev->flat_regs, regs, 4);
+            dev->flat_top = dev->top;
+            opti55x_ram_copy(dev, regs, dev->top, 1);
+            /* PCI memory may sit between the RAM top and the 86Box RAM size */
+            mem_set_mem_state_both(0x100000, dev->top - 0x100000, MEM_READ_INTERNAL | MEM_WRITE_INTERNAL);
+            mem_set_mem_state_both(dev->top, mem_size * 1024 - dev->top, MEM_READ_EXTERNAL | MEM_WRITE_EXTERNAL);
+        }
+    } else if (!flat || (overlay == dev->overlay))
         return;
-    if (dev->flat > 0)
-        opti55x_ram_copy(dev, dev->flat_regs, dev->flat_top, 0);
-    dev->flat = flat;
+    dev->overlay = overlay;
     if (flat) {
-        memcpy(dev->flat_regs, regs, 4);
-        dev->flat_top = top;
-        opti55x_ram_copy(dev, regs, top, 1);
-        /* PCI memory may sit between the RAM top and the 86Box RAM size */
-        mem_set_mem_state_both(0x100000, top - 0x100000, MEM_READ_INTERNAL | MEM_WRITE_INTERNAL);
-        mem_set_mem_state_both(top, mem_size * 1024 - top, MEM_READ_EXTERNAL | MEM_WRITE_EXTERNAL);
-        mem_mapping_disable(&dev->low_mapping);
-        mem_mapping_disable(&dev->high_mapping);
         mem_mapping_enable(&ram_low_mapping);
-        mem_mapping_set_addr(&ram_high_mapping, 0x100000, top - 0x100000);
+        mem_mapping_set_addr(&ram_high_mapping, 0x100000, dev->top - 0x100000);
     } else {
         /* off, not only covered: a mapping without exec pointer keeps the RAM's, code would run from stale RAM */
         mem_mapping_disable(&ram_low_mapping);
         mem_mapping_disable(&ram_high_mapping);
+    }
+    if (flat && !overlay) {
+        mem_mapping_disable(&dev->low_mapping);
+        mem_mapping_disable(&dev->high_mapping);
+    } else { /* code fetches from flat RAM bypass the L1 model, as they do the P54C's data cache */
+        mem_mapping_set_exec(&dev->low_mapping, flat ? ram : NULL);
+        mem_mapping_set_exec(&dev->high_mapping, flat ? (ram + 0x100000) : NULL);
+        mem_mapping_set_addr(&dev->high_mapping, 0x100000, (flat ? dev->top : 0x10000000) - 0x100000);
         mem_mapping_enable(&dev->low_mapping);
-        mem_mapping_enable(&dev->high_mapping);
     }
     if (dev->stuck_addr)
         mem_mapping_set_exec(&dev->stuck_mapping, flat ? (ram + (dev->stuck_addr & ~0xfff)) : NULL);
     flushmmucache();
+}
+
+static opti55x_t *opti55x_model;
+
+static void
+opti55x_cache_event(int event)
+{
+    cache_l1_event(&opti55x_model->l1, event);
+}
+
+static void
+opti55x_l1_update(void *priv)
+{
+    opti55x_dram_update((opti55x_t *) priv);
 }
 
 static void
@@ -1295,6 +1356,7 @@ opti55x_reset(void *priv)
 
     if (dev->dram) {
         dev->regs[0x00] = dev->regs[0x13] = dev->regs[0x14] = dev->regs[0x19] = 0x00;
+        cache_l1_reset(&dev->l1);
         opti55x_dram_update(dev);
     }
 }
@@ -1307,6 +1369,8 @@ opti55x_close(void *priv)
     smram_del(dev->smram);
 
     if (dev->dram) {
+        cpu_cache_hook = NULL;
+        cache_l1_close(&dev->l1);
         mem_mapping_disable(&dev->low_mapping);
         mem_mapping_disable(&dev->high_mapping);
         if (dev->stuck_addr)
@@ -1365,7 +1429,16 @@ opti55x_init(const device_t *info)
             mem_mapping_add(&dev->stuck_mapping, dev->stuck_addr & ~0xfff, 0x1000, opti55x_stuck_readb,
                             opti55x_stuck_readw, opti55x_stuck_readl, opti55x_ram_writeb, opti55x_ram_writew,
                             opti55x_ram_writel, NULL, 0, dev);
-        dev->flat = -1; /* no layout yet: the reset sets one up */
+        dev->flat      = -1; /* no layout yet: the reset sets one up */
+        dev->l1.geo    = &cache_l1_p54c;
+        dev->l1.priv   = dev;
+        dev->l1.load   = opti55x_dram_load;
+        dev->l1.store  = opti55x_dram_store;
+        dev->l1.fill   = opti55x_l1_fill;
+        dev->l1.update = opti55x_l1_update;
+        cache_l1_init(&dev->l1);
+        opti55x_model  = dev;
+        cpu_cache_hook = opti55x_cache_event;
     }
 
     dev->has_ide = (info->local & 0x01);

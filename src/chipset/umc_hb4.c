@@ -117,6 +117,7 @@
 #include <86box/port_92.h>
 #include <86box/smram.h>
 #include <86box/chipset.h>
+#include <86box/cache_l1.h>
 
 #ifdef ENABLE_HB4_LOG
 int hb4_do_log = ENABLE_HB4_LOG;
@@ -135,9 +136,6 @@ hb4_log(const char *fmt, ...)
 #else
 #    define hb4_log(fmt, ...)
 #endif
-
-#define L1_SETS 256 /* 16 KB, 4-way, 16-byte lines (Am5x86) */
-#define L1_WAYS 4
 
 typedef struct hb4_simm_t {
     uint8_t  cols;
@@ -190,14 +188,7 @@ typedef struct hb4_t {
     uint32_t      stuck_addr; /* fault injection: this byte reads bit stuck_mask as 0; 0: none */
     uint8_t       stuck_mask;
     mem_mapping_t stuck_mapping;
-
-    /* Internal cache, for cache-as-RAM only: lines read after INVD, served while CR0.CD and NW are set */
-    uint32_t   l1_tag[L1_SETS][L1_WAYS];
-    uint8_t    l1_data[L1_SETS][L1_WAYS][16];
-    uint8_t    l1_next[L1_SETS];
-    int        l1_track;
-    int        l1_car;
-    pc_timer_t l1_timer;
+    cache_l1_t    l1;           /* the CPU's internal cache, for cache-as-RAM */
 } hb4_t;
 
 static int shadow_bios[4]  = { (MEM_READ_EXTANY | MEM_WRITE_INTERNAL), (MEM_READ_EXTANY | MEM_WRITE_EXTANY),
@@ -630,29 +621,22 @@ hb4_store(hb4_t *dev, uint32_t addr, uint8_t val)
         hb4_dram_store(dev, addr, val);
 }
 
-static uint8_t *
-hb4_l1_line(hb4_t *dev, uint32_t addr, int read)
+static uint8_t
+hb4_l1_load(void *priv, uint32_t addr)
 {
-    uint32_t tag = (addr & ~15) | 1;
-    uint32_t set = (addr >> 4) % L1_SETS;
+    return hb4_load((hb4_t *) priv, addr);
+}
 
-    if (dma_bm_busy) /* bus master cycles: the CPU's L1 neither fills nor answers */
-        return NULL;
-    for (int way = 0; way < L1_WAYS; way++)
-        if (dev->l1_tag[set][way] == tag)
-            return dev->l1_car ? dev->l1_data[set][way] : NULL;
-    if (read && dev->l1_track)
-        dev->l1_tag[set][dev->l1_next[set]++ % L1_WAYS] = tag;
-    return NULL;
+static void
+hb4_l1_store(void *priv, uint32_t addr, uint8_t val)
+{
+    hb4_store((hb4_t *) priv, addr, val);
 }
 
 static uint8_t
 hb4_ram_readb(uint32_t addr, void *priv)
 {
-    hb4_t   *dev  = (hb4_t *) priv;
-    uint8_t *line = hb4_l1_line(dev, addr, 1);
-
-    return line ? line[addr & 15] : hb4_load(dev, addr);
+    return cache_l1_read(&((hb4_t *) priv)->l1, addr);
 }
 
 static uint16_t
@@ -670,13 +654,7 @@ hb4_ram_readl(uint32_t addr, void *priv)
 static void
 hb4_ram_writeb(uint32_t addr, uint8_t val, void *priv)
 {
-    hb4_t   *dev  = (hb4_t *) priv;
-    uint8_t *line = hb4_l1_line(dev, addr, 0);
-
-    if (line)
-        line[addr & 15] = val;
-    else
-        hb4_store(dev, addr, val);
+    cache_l1_write(&((hb4_t *) priv)->l1, addr, val);
 }
 
 static void
@@ -745,7 +723,7 @@ hb4_ram_update(hb4_t *dev)
     uint32_t top     = hb4_region(regs, 0).size + hb4_region(regs, 1).size;
     int      flat    = (top >= 0x100000) && (top <= mem_size * 1024) && hb4_region_flat(dev, regs, 0) &&
                        hb4_region_flat(dev, regs, 1);
-    int      overlay = dev->l1_track || dev->l1_car || hb4_l2_forced(dev) || hb4_l2_active(dev);
+    int      overlay = cache_l1_active(&dev->l1) || hb4_l2_forced(dev) || hb4_l2_active(dev);
 
     if ((flat != dev->flat) || (flat && memcmp(regs, dev->flat_regs, 3))) {
         if (dev->flat)
@@ -781,62 +759,20 @@ hb4_ram_update(hb4_t *dev)
 static hb4_t *hb4_model;
 
 static void
-hb4_l1_lines(hb4_t *dev, int to_l1)
-{
-    for (int set = 0; set < L1_SETS; set++)
-        for (int way = 0; way < L1_WAYS; way++)
-            for (int i = 0; dev->l1_tag[set][way] && (i < 16); i++) {
-                uint32_t addr = (dev->l1_tag[set][way] & ~15) + i;
-                if (to_l1)
-                    dev->l1_data[set][way][i] = hb4_load(dev, addr);
-                else
-                    hb4_store(dev, addr, dev->l1_data[set][way][i]);
-            }
-}
-
-/* CPU cache events: INVD starts recording the lines filled, setting CR0.CD and NW then turns them into
-   cache-as-RAM until the next invalidation; leaving that mode keeps what the CPU saw. */
-static void
 hb4_cache_event(int event)
 {
     hb4_t *dev = hb4_model;
-    int    car = (cr0 & 0x60000000) == 0x60000000;
 
     /* on the real chip a flush also empties the L2: logged so tests can count them (slow POST) */
     if ((event == CPU_CACHE_WBINVD) && (dev->pci_conf[0x50] & 0x80) && hb4_l2_prog(dev))
         fprintf(stderr, "UMC HB4: WBINVD with the L2 on\n");
-
-    if (event != CPU_CACHE_CR0) {
-        memset(dev->l1_tag, 0, sizeof(dev->l1_tag));
-        dev->l1_car   = 0;
-        dev->l1_track = event == CPU_CACHE_INVD;
-        if (dev->l1_track)
-            timer_on_auto(&dev->l1_timer, 10000.0);
-    } else if (dev->l1_track && (cr0 & 0x40000000)) {
-        dev->l1_track = 0;
-        dev->l1_car   = car;
-        if (car)
-            hb4_l1_lines(dev, 1);
-        else
-            memset(dev->l1_tag, 0, sizeof(dev->l1_tag));
-    } else if (dev->l1_car && !car) {
-        hb4_l1_lines(dev, 0);
-        memset(dev->l1_tag, 0, sizeof(dev->l1_tag));
-        dev->l1_car = 0;
-    }
-    hb4_ram_update(dev);
+    cache_l1_event(&dev->l1, event);
 }
 
 static void
-hb4_l1_timeout(void *priv)
+hb4_l1_update(void *priv)
 {
-    hb4_t *dev = (hb4_t *) priv;
-
-    if (dev->l1_track) {
-        dev->l1_track = 0;
-        memset(dev->l1_tag, 0, sizeof(dev->l1_tag));
-        hb4_ram_update(dev);
-    }
+    hb4_ram_update((hb4_t *) priv);
 }
 
 static void
@@ -982,9 +918,7 @@ hb4_reset(void *priv)
     memset(dev->mem_state, 0x00, sizeof(dev->mem_state));
 
     if (dev->model) {
-        memset(dev->l1_tag, 0, sizeof(dev->l1_tag));
-        dev->l1_track = dev->l1_car = 0;
-        timer_disable(&dev->l1_timer);
+        cache_l1_reset(&dev->l1);
         hb4_ram_update(dev);
     }
 }
@@ -996,7 +930,7 @@ hb4_close(void *priv)
 
     if (dev->model) {
         cpu_cache_hook = NULL;
-        timer_disable(&dev->l1_timer);
+        cache_l1_close(&dev->l1);
         mem_mapping_disable(&dev->low_mapping);
         mem_mapping_disable(&dev->high_mapping);
         if (dev->stuck_addr)
@@ -1077,7 +1011,12 @@ hb4_init(UNUSED(const device_t *info))
                 dev->l2_tag[i] = x >> 48;
         }
         memset(dev->l2_bad, 1, 1 << 16);
-        timer_add(&dev->l1_timer, hb4_l1_timeout, dev, 0);
+        dev->l1.geo    = &cache_l1_486;
+        dev->l1.priv   = dev;
+        dev->l1.load   = hb4_l1_load;
+        dev->l1.store  = hb4_l1_store;
+        dev->l1.update = hb4_l1_update;
+        cache_l1_init(&dev->l1);
         timer_add(&dev->l2_timer, hb4_l2_settle, dev, 0);
         hb4_model      = dev;
         cpu_cache_hook = hb4_cache_event;
