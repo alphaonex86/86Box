@@ -931,8 +931,8 @@ inboard386_init(const device_t *info)
        3 MB board. The driver is asking for a page directory in its own RAM; only a machine
        that decodes all 32 address lines would fail to find it.
 
-       Without this the page-directory read lands in unbacked memory, mem.c's rammap()
-       scratch page returns 0xFFFFFFFF - present bit SET, frame 0xFFFFF000 - so the walk
+       Without this the page-directory read lands in unbacked memory, mem.c's pt_read()
+       reads the floating bus, 0xFFFFFFFF - present bit SET, frame 0xFFFFF000 - so the walk
        "succeeds" into nothing and the guest takes a page fault, then a double fault, then
        a triple fault and resets a few seconds after the driver loads. Observed as
        `vec=0E cr2=00019EB0 cr3=802EC000`.

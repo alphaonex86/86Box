@@ -289,26 +289,33 @@ mem_flush_write_page(uint32_t addr, uint32_t virt)
 
 #define mmutranslate_read(addr)  mmutranslatereal(addr, 0)
 #define mmutranslate_write(addr) mmutranslatereal(addr, 1)
-/* A page-table walk can legitimately land on a physical page with no RAM behind it:
-   `_mem_exec[]` is explicitly NULL both for addresses beyond installed RAM and for
-   MMIO-style mappings that have no exec pointer. The old macros cast that NULL and
-   indexed it, so a guest that merely pointed CR3 somewhere unbacked terminated the
-   emulator - observed as an access violation at the `rammap(addr2)` in
-   mmutranslatereal_normal() below, with an Intel Inboard 386/PC and Intel's own
-   INBRDPC.SYS, which does exactly that. Hardware has no notion of "absent" here; it
-   reads the bus and gets floating high bits. So substitute a shared page of 0xFF,
-   matching this file's own convention that an unmapped read returns 0xFF.
+/* A page-table walk reads RAM through its exec pointer. A page without one (a chipset's DRAM decode handlers, MMIO,
+   nothing at all) goes through the bus handlers like any other access: absent memory reads 0xFF and ignores the
+   accessed/dirty bits, as hardware floats the bus (an Intel Inboard 386/PC with INBRDPC.SYS points CR3 there). */
+static __inline uint32_t
+pt_read(uint32_t addr)
+{
+    const uint8_t *page = _mem_exec[addr >> MEM_GRANULARITY_BITS];
 
-   This keeps both macros usable as lvalues, which matters because several callers do
-   `rammap(x) |= ...` to set accessed/dirty bits. Those writes land in the scratch page
-   and are discarded, which is correct for memory that is not there - and the page stays
-   all-ones because the only writes are ORs of a few bits, so it cannot drift into
-   handing back a bogus present entry later. */
-static uint8_t mem_unbacked_pt_page[MEM_GRANULARITY_SIZE];
+    return page ? ((const uint32_t *) page)[(addr >> 2) & MEM_GRANULARITY_QMASK] : mem_readl_phys(addr);
+}
 
-#define rammap_backing(x)        (_mem_exec[(x) >> MEM_GRANULARITY_BITS] ? _mem_exec[(x) >> MEM_GRANULARITY_BITS] : mem_unbacked_pt_page)
-#define rammap(x)                ((uint32_t *) rammap_backing(x))[((x) >> 2) & MEM_GRANULARITY_QMASK]
-#define rammap64(x)              ((uint64_t *) rammap_backing(x))[((x) >> 3) & MEM_GRANULARITY_PMASK]
+static __inline void
+pt_set(uint32_t addr, uint32_t bits)
+{
+    uint8_t *page = _mem_exec[addr >> MEM_GRANULARITY_BITS];
+
+    if (page)
+        ((uint32_t *) page)[(addr >> 2) & MEM_GRANULARITY_QMASK] |= bits;
+    else
+        mem_writel_phys(addr, mem_readl_phys(addr) | bits);
+}
+
+static __inline uint64_t
+pt_read64(uint32_t addr)
+{
+    return pt_read(addr) | ((uint64_t) pt_read(addr + 4) << 32);
+}
 
 /* The PAE page-directory-pointer table entries, loaded with CR3 and kept
    until CR3 is loaded again (Pentium Pro vol. 3, 3.8). */
@@ -322,7 +329,7 @@ pae_check_load(uint32_t cr3_val)
     uint64_t entries[4];
 
     for (int i = 0; i < 4; i++) {
-        entries[i] = rammap64((cr3_val & ~0x1f) + (i << 3));
+        entries[i] = pt_read64((cr3_val & ~0x1f) + (i << 3));
         if ((entries[i] & 1) && (entries[i] & 0xfffffff0000001e6ULL))
             return 1;
     }
@@ -335,7 +342,7 @@ void
 pae_load_pdptes(void)
 {
     for (int i = 0; i < 4; i++)
-        pae_pdpte[i] = rammap64((cr3 & ~0x1f) + (i << 3));
+        pae_pdpte[i] = pt_read64((cr3 & ~0x1f) + (i << 3));
 }
 
 static __inline uint64_t
@@ -350,7 +357,7 @@ mmutranslatereal_normal(uint32_t addr, int rw)
         return 0xffffffffffffffffULL;
 
     addr2 = ((cr3 & ~0xfff) + ((addr >> 20) & 0xffc));
-    temp = temp2 = rammap(addr2);
+    temp = temp2 = pt_read(addr2);
     if (!(temp & 1)) {
         cr2 = addr;
         temp &= 1;
@@ -378,7 +385,7 @@ mmutranslatereal_normal(uint32_t addr, int rw)
             return 0xffffffffffffffffULL;
         }
 
-        rammap(addr2) |= (rw ? 0x60 : 0x20);
+        pt_set(addr2, (rw ? 0x60 : 0x20));
 
         uint64_t page = temp & ~0x3fffff;
         if (cpu_features & CPU_FEATURE_PSE36)
@@ -386,7 +393,7 @@ mmutranslatereal_normal(uint32_t addr, int rw)
         return page + (addr & 0x3fffff);
     }
 
-    temp  = rammap((temp & ~0xfff) + ((addr >> 10) & 0xffc));
+    temp  = pt_read((temp & ~0xfff) + ((addr >> 10) & 0xffc));
     temp3 = temp & temp2;
     if (!(temp & 1) || ((CPL == 3) && !(temp3 & 4) && !cpl_override) || (rw && !cpl_override && !(temp3 & 2) && (((CPL == 3) && !cpl_override) || ((is486 || isibm486) && (cr0 & WP_FLAG))))) {
         cr2 = addr;
@@ -400,8 +407,8 @@ mmutranslatereal_normal(uint32_t addr, int rw)
         return 0xffffffffffffffffULL;
     }
 
-    rammap(addr2) |= 0x20;
-    rammap((temp2 & ~0xfff) + ((addr >> 10) & 0xffc)) |= (rw ? 0x60 : 0x20);
+    pt_set(addr2, 0x20);
+    pt_set((temp2 & ~0xfff) + ((addr >> 10) & 0xffc), (rw ? 0x60 : 0x20));
 
     return (uint64_t) ((temp & ~0xfff) + (addr & 0xfff));
 }
@@ -433,7 +440,7 @@ mmutranslatereal_pae(uint32_t addr, int rw)
     }
 
     addr3 = (temp & ~0xfffULL) + ((addr >> 18) & 0xff8);
-    temp = temp4 = rammap64(addr3) & 0x000000ffffffffffULL;
+    temp = temp4 = pt_read64(addr3) & 0x000000ffffffffffULL;
     temp3        = temp & temp2;
     if (!(temp & 1)) {
         cr2 = addr;
@@ -461,13 +468,13 @@ mmutranslatereal_pae(uint32_t addr, int rw)
 
             return 0xffffffffffffffffULL;
         }
-        rammap64(addr3) |= (rw ? 0x60 : 0x20);
+        pt_set(addr3, (rw ? 0x60 : 0x20));
 
         return ((temp & ~0x1fffffULL) + (addr & 0x1fffffULL)) & 0x000000ffffffffffULL;
     }
 
     addr4 = (temp & ~0xfffULL) + ((addr >> 9) & 0xff8);
-    temp  = rammap64(addr4) & 0x000000ffffffffffULL;
+    temp  = pt_read64(addr4) & 0x000000ffffffffffULL;
     temp3 = temp & temp4;
     if (!(temp & 1) || ((CPL == 3) && !(temp3 & 4) && !cpl_override) || (rw && !cpl_override && !(temp3 & 2) && (((CPL == 3) && !cpl_override) || (cr0 & WP_FLAG)))) {
         cr2 = addr;
@@ -481,8 +488,8 @@ mmutranslatereal_pae(uint32_t addr, int rw)
         return 0xffffffffffffffffULL;
     }
 
-    rammap64(addr3) |= 0x20;
-    rammap64(addr4) |= (rw ? 0x60 : 0x20);
+    pt_set(addr3, 0x20);
+    pt_set(addr4, (rw ? 0x60 : 0x20));
 
     return ((temp & ~0xfffULL) + ((uint64_t) (addr & 0xfff))) & 0x000000ffffffffffULL;
 }
@@ -523,7 +530,7 @@ mmutranslate_noabrt_normal(uint32_t addr, int rw)
         return 0xffffffffffffffffULL;
 
     addr2 = ((cr3 & ~0xfff) + ((addr >> 20) & 0xffc));
-    temp = temp2 = rammap(addr2);
+    temp = temp2 = pt_read(addr2);
 
     if (!(temp & 1))
         return 0xffffffffffffffffULL;
@@ -539,7 +546,7 @@ mmutranslate_noabrt_normal(uint32_t addr, int rw)
         return page + (addr & 0x3fffff);
     }
 
-    temp  = rammap((temp & ~0xfff) + ((addr >> 10) & 0xffc));
+    temp  = pt_read((temp & ~0xfff) + ((addr >> 10) & 0xffc));
     temp3 = temp & temp2;
 
     if (!(temp & 1) || ((CPL == 3) && !(temp3 & 4) && !cpl_override) || (rw && !cpl_override && !(temp3 & 2) && ((CPL == 3) || (cr0 & WP_FLAG))))
@@ -567,7 +574,7 @@ mmutranslate_noabrt_pae(uint32_t addr, int rw)
         return 0xffffffffffffffffULL;
 
     addr3 = (temp & ~0xfffULL) + ((addr >> 18) & 0xff8);
-    temp = temp4 = rammap64(addr3) & 0x000000ffffffffffULL;
+    temp = temp4 = pt_read64(addr3) & 0x000000ffffffffffULL;
     temp3        = temp & temp2;
 
     if (!(temp & 1))
@@ -582,7 +589,7 @@ mmutranslate_noabrt_pae(uint32_t addr, int rw)
     }
 
     addr4 = (temp & ~0xfffULL) + ((addr >> 9) & 0xff8);
-    temp  = rammap64(addr4) & 0x000000ffffffffffULL;
+    temp  = pt_read64(addr4) & 0x000000ffffffffffULL;
 
     temp3 = temp & temp4;
 
@@ -3035,8 +3042,6 @@ mem_reset(void)
     }
 
     memset(_mem_exec, 0x00, sizeof(_mem_exec));
-    /* Reads of absent physical memory return floating high bits - see rammap() above. */
-    memset(mem_unbacked_pt_page, 0xff, sizeof(mem_unbacked_pt_page));
     memset(_mem_wp, 0x00, sizeof(_mem_wp));
     memset(_mem_wp_bus, 0x00, sizeof(_mem_wp_bus));
     memset(write_mapping, 0x00, sizeof(write_mapping));
