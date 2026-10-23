@@ -68,6 +68,25 @@ opti55x_log(void *priv, const char *fmt, ...)
 #    define opti55x_log(fmt, ...)
 #endif
 
+typedef struct opti55x_simm_t {
+    uint8_t  rows;   /* row and column address bits, sides: of each SIMM of the pair */
+    uint8_t  cols;
+    uint8_t  sides;
+    uint32_t offset; /* of the pair in simm_data */
+} opti55x_simm_t;
+
+/* Device option value -> SIMM */
+static const opti55x_simm_t simm_types[] = {
+    { 0 }, { 9, 9, 1 }, { 9, 9, 2 }, { 10, 9, 1 }, { 10, 10, 1 }, { 10, 10, 2 },
+    { 11, 10, 1 }, { 11, 11, 1 }, { 11, 10, 2 }, { 11, 11, 2 }, { 12, 11, 1 }
+};
+
+/* Table 5-36, the 82C546/547 configurations of 00h bits 4-0: bank 1 code << 4 | bank 0 code */
+static const uint8_t compat_banks[27] = {
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x11, 0x21, 0x22, 0x31, 0x32, 0x33, 0x41, 0x42,
+    0x43, 0x44, 0x51, 0x52, 0x53, 0x54, 0x55, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66
+};
+
 typedef struct opti55x_t {
     uint8_t     nb_slot;
     uint8_t     sb_slot;
@@ -94,6 +113,21 @@ typedef struct opti55x_t {
     nvr_t      *nvr;
 
     sff8038i_t *bm[2];
+
+    /* DRAM model, see opti55x_dram_decode() */
+    int            dram;
+    opti55x_simm_t simm[2];
+    uint8_t       *simm_data;
+    uint8_t        dram_regs[4]; /* 00h (82C546/547 mode only), 13h, 14h, 19h: the decode bits */
+    int            flat;         /* one-to-one decode: data in 86Box RAM below flat_top, laid out by flat_regs;
+                                    -1 before the first reset */
+    uint32_t       flat_top;
+    uint8_t        flat_regs[4];
+    mem_mapping_t  low_mapping;
+    mem_mapping_t  high_mapping;
+    uint32_t       stuck_addr;   /* fault injection: this byte reads bit stuck_mask as 0; 0: none */
+    uint8_t        stuck_mask;
+    mem_mapping_t  stuck_mapping;
 
     void *      log; /* New logging system */
 } opti55x_t;
@@ -145,6 +179,221 @@ opti55x_smram_recalc(void *priv)
         smram_enable(dev->smram, 0x000a0000, 0x000a0000, 0x10000, (dev->regs[0x0d] & 0x08), (dev->regs[0x13] & 0x08) && !(dev->regs[0x1d] & 0x01));
         smram_enable(dev->smram, 0x000b0000, 0x000b0000, 0x10000, (dev->regs[0x0d] & 0x08), (dev->regs[0x13] & 0x08) && !(dev->regs[0x1d] & 0x02));
     }
+}
+
+/*
+   DRAM model (fork), enabled when a SIMM pair is set in the device options: CPU addresses are decoded to
+   SIMM cells as the 82C557M programs them (Viper-M data book), so a BIOS sizing the banks sees the aliases
+   and holes of real hardware. The 64-bit banks RAS0#-RAS5# follow each other from 0, code n = 2 MB << (n - 1):
+   full decode (13h bit 7) 13h, 14h and 19h (bank 4 with bit 3, bank 5 with bit 7), else table 5-36 by 00h.
+   A SIMM pair holds banks 2p (side A) and 2p + 1 (side B); banks 4 and 5 have no sockets. Table 4-16: column
+   MA0-8 = A3-A11, row MA0-8 = A12-A20, then row MA9-11 = A21/A23/A25 and column A22/A24/A26 as far as the
+   bank code needs; MA11 is RAS4# with 19h bit 3. While that decode is one-to-one the data is in flat 86Box
+   RAM, else in simm_data behind the opti55x_ram_* handlers (0-640K and 1M-256M).
+*/
+static void
+opti55x_bank_codes(const uint8_t *regs, uint8_t *code)
+{
+    uint8_t pairs[3] = { regs[1], regs[2], regs[3] };
+
+    if (!(regs[1] & 0x80)) {
+        pairs[0] = (regs[0] < sizeof(compat_banks)) ? compat_banks[regs[0]] : 0;
+        pairs[1] = pairs[2] = 0;
+    }
+    for (int bank = 0; bank < 6; bank++)
+        code[bank] = (pairs[bank >> 1] >> ((bank & 1) * 4)) & 7;
+    if (!(regs[3] & 0x08))
+        code[4] = 0;
+    if (!(regs[3] & 0x80))
+        code[5] = 0;
+}
+
+static int64_t
+opti55x_dram_decode(const opti55x_t *dev, const uint8_t *regs, uint32_t addr)
+{
+    uint8_t  code[6];
+    uint32_t base = 0;
+    int      bank;
+
+    opti55x_bank_codes(regs, code);
+    for (bank = 0; bank < 6; bank++) {
+        uint32_t size = code[bank] ? (1u << (20 + code[bank])) : 0;
+        if (addr - base < size)
+            break;
+        base += size;
+    }
+    if ((bank >= 4) || ((bank & 1) >= dev->simm[bank >> 1].sides))
+        return -1;
+
+    const opti55x_simm_t *simm = &dev->simm[bank >> 1];
+    int                   n    = code[bank];
+    uint32_t              row  = (addr >> 12) & 0x1ff;
+    uint32_t              col  = (addr >> 3) & 0x1ff;
+
+    for (int i = 0; i < ((regs[3] & 0x08) ? 2 : 3); i++) {
+        if (i < n / 2)
+            row |= ((addr >> (21 + 2 * i)) & 1) << (9 + i);
+        if (i < (n - 1) / 2)
+            col |= ((addr >> (22 + 2 * i)) & 1) << (9 + i);
+    }
+    row &= (1u << simm->rows) - 1;
+    col &= (1u << simm->cols) - 1;
+    return simm->offset + ((((((uint64_t) (bank & 1) << simm->rows) | row) << simm->cols) | col) << 3) + (addr & 7);
+}
+
+/* One-to-one decode: every bank has its SIMM side and the SIMM has every MA line its code drives. */
+static int
+opti55x_dram_flat(const opti55x_t *dev, const uint8_t *regs, uint32_t *top)
+{
+    uint8_t code[6];
+    int     flat = 1;
+
+    opti55x_bank_codes(regs, code);
+    *top = 0;
+    for (int bank = 0; bank < 6; bank++) {
+        int n = code[bank];
+        if (!n)
+            continue;
+        *top += 1u << (20 + n);
+        if ((bank >= 4) || ((bank & 1) >= dev->simm[bank >> 1].sides) || ((regs[3] & 0x08) && (n >= 6)) ||
+            (9 + n / 2 > dev->simm[bank >> 1].rows) || (9 + (n - 1) / 2 > dev->simm[bank >> 1].cols))
+            flat = 0;
+    }
+    return flat && (*top >= 0x100000) && (*top <= mem_size * 1024);
+}
+
+/* DRAM: flat RAM or SIMM cells; unanswered reads float high. */
+static uint8_t
+opti55x_ram_readb(uint32_t addr, void *priv)
+{
+    const opti55x_t *dev = (opti55x_t *) priv;
+
+    if (dev->flat)
+        return (addr < dev->flat_top) ? ram[addr] : 0xff;
+    int64_t offset = opti55x_dram_decode(dev, dev->dram_regs, addr);
+    return (offset < 0) ? 0xff : dev->simm_data[offset];
+}
+
+static uint16_t
+opti55x_ram_readw(uint32_t addr, void *priv)
+{
+    return opti55x_ram_readb(addr, priv) | (opti55x_ram_readb(addr + 1, priv) << 8);
+}
+
+static uint32_t
+opti55x_ram_readl(uint32_t addr, void *priv)
+{
+    return opti55x_ram_readw(addr, priv) | ((uint32_t) opti55x_ram_readw(addr + 2, priv) << 16);
+}
+
+static void
+opti55x_ram_writeb(uint32_t addr, uint8_t val, void *priv)
+{
+    opti55x_t *dev = (opti55x_t *) priv;
+
+    if (dev->flat) {
+        if (addr < dev->flat_top)
+            mem_write_ramb_page(addr, val, &pages[addr >> 12]); /* tracks code pages */
+        return;
+    }
+    int64_t offset = opti55x_dram_decode(dev, dev->dram_regs, addr);
+    if (offset >= 0)
+        dev->simm_data[offset] = val;
+}
+
+static void
+opti55x_ram_writew(uint32_t addr, uint16_t val, void *priv)
+{
+    opti55x_ram_writeb(addr, val, priv);
+    opti55x_ram_writeb(addr + 1, val >> 8, priv);
+}
+
+static void
+opti55x_ram_writel(uint32_t addr, uint32_t val, void *priv)
+{
+    opti55x_ram_writew(addr, val, priv);
+    opti55x_ram_writew(addr + 2, val >> 16, priv);
+}
+
+static uint8_t
+opti55x_stuck_readb(uint32_t addr, void *priv)
+{
+    const opti55x_t *dev = (opti55x_t *) priv;
+    uint8_t          val = opti55x_ram_readb(addr, priv);
+
+    return (addr == dev->stuck_addr) ? (val & ~dev->stuck_mask) : val;
+}
+
+static uint16_t
+opti55x_stuck_readw(uint32_t addr, void *priv)
+{
+    return opti55x_stuck_readb(addr, priv) | (opti55x_stuck_readb(addr + 1, priv) << 8);
+}
+
+static uint32_t
+opti55x_stuck_readl(uint32_t addr, void *priv)
+{
+    return opti55x_stuck_readw(addr, priv) | ((uint32_t) opti55x_stuck_readw(addr + 2, priv) << 16);
+}
+
+/* Copies flat 86Box RAM from (to_ram: to) the SIMMs; 4 KB DRAM pages are contiguous in both. */
+static void
+opti55x_ram_copy(opti55x_t *dev, const uint8_t *regs, uint32_t top, int to_ram)
+{
+    for (uint32_t addr = 0; addr < top; addr += 0x1000) {
+        if (addr == 0xa0000)
+            addr = 0x100000;
+
+        int64_t offset = opti55x_dram_decode(dev, regs, addr);
+        if (offset < 0)
+            fatal("OPTi 82C557M: flat RAM at %08X not decoded\n", addr);
+        if (to_ram)
+            memcpy(ram + addr, dev->simm_data + offset, 0x1000);
+        else
+            memcpy(dev->simm_data + offset, ram + addr, 0x1000);
+    }
+    if (to_ram)
+        mem_invalidate_range(0, top - 1);
+}
+
+static void
+opti55x_dram_update(opti55x_t *dev)
+{
+    uint8_t *regs = dev->dram_regs;
+    uint32_t top;
+
+    regs[0] = (dev->regs[0x13] & 0x80) ? 0x00 : (dev->regs[0x00] & 0x1f);
+    regs[1] = dev->regs[0x13] & 0xf7; /* without the SMRAM bits */
+    regs[2] = dev->regs[0x14] & 0x77;
+    regs[3] = dev->regs[0x19];
+    int flat = opti55x_dram_flat(dev, regs, &top);
+
+    if ((flat == dev->flat) && (!flat || !memcmp(regs, dev->flat_regs, 4)))
+        return;
+    if (dev->flat > 0)
+        opti55x_ram_copy(dev, dev->flat_regs, dev->flat_top, 0);
+    dev->flat = flat;
+    if (flat) {
+        memcpy(dev->flat_regs, regs, 4);
+        dev->flat_top = top;
+        opti55x_ram_copy(dev, regs, top, 1);
+        /* PCI memory may sit between the RAM top and the 86Box RAM size */
+        mem_set_mem_state_both(0x100000, top - 0x100000, MEM_READ_INTERNAL | MEM_WRITE_INTERNAL);
+        mem_set_mem_state_both(top, mem_size * 1024 - top, MEM_READ_EXTERNAL | MEM_WRITE_EXTERNAL);
+        mem_mapping_disable(&dev->low_mapping);
+        mem_mapping_disable(&dev->high_mapping);
+        mem_mapping_enable(&ram_low_mapping);
+        mem_mapping_set_addr(&ram_high_mapping, 0x100000, top - 0x100000);
+    } else {
+        /* off, not only covered: a mapping without exec pointer keeps the RAM's, code would run from stale RAM */
+        mem_mapping_disable(&ram_low_mapping);
+        mem_mapping_disable(&ram_high_mapping);
+        mem_mapping_enable(&dev->low_mapping);
+        mem_mapping_enable(&dev->high_mapping);
+    }
+    if (dev->stuck_addr)
+        mem_mapping_set_exec(&dev->stuck_mapping, flat ? (ram + (dev->stuck_addr & ~0xfff)) : NULL);
+    flushmmucache();
 }
 
 static void
@@ -531,13 +780,10 @@ opti55x_isa_write(uint16_t addr, uint8_t val, void *priv)
             break;
         case 0x24:
             switch (dev->idx) {
-                case 0x00:
-                    if (dev->regs[0x13] & 0x80) /* 82C557M Byte Merge/Prefetch and Sony Cache Module Control */
-                        dev->regs[0x00] = val;
-                    else { /* 82C54x-compatible DRAM Config Register 1 */
-                        /* TODO: Implement DRAM rows */
-                        dev->regs[0x00] = val;
-                    }
+                case 0x00: /* 82C557M Byte Merge/Prefetch (13h bit 7) or 82C54x-compatible DRAM Config Register 1 */
+                    dev->regs[0x00] = val;
+                    if (dev->dram)
+                        opti55x_dram_update(dev);
                     break;
                 case 0x01: /* 82C557M DRAM Control Register 1 */
                     dev->regs[0x01] = val;
@@ -592,12 +838,11 @@ opti55x_isa_write(uint16_t addr, uint8_t val, void *priv)
                     dev->regs[0x12] = val;
                     break;
                 case 0x13: /* 82C557M Memory Decode Control Register 1 */
-                    dev->regs[0x13] = val;
-                    opti55x_smram_recalc(dev);
-                    break;
                 case 0x14: /* 82C557M Memory Decode Control Register 2 */
-                    dev->regs[0x14] = val;
+                    dev->regs[dev->idx] = val;
                     opti55x_smram_recalc(dev);
+                    if (dev->dram)
+                        opti55x_dram_update(dev);
                     break;
                 case 0x15: /* 82C557M PCI Cycle Control Register 1 */
                     dev->regs[0x15] = val;
@@ -613,6 +858,8 @@ opti55x_isa_write(uint16_t addr, uint8_t val, void *priv)
                     break;
                 case 0x19: /* 82C557M Memory Decode Control Register 3 */
                     dev->regs[0x19] = val;
+                    if (dev->dram)
+                        opti55x_dram_update(dev);
                     break;
                 case 0x1a: /* 82C557M Memory Shadow Control Register 1 */
                     dev->regs[0x1a] = val;
@@ -1045,6 +1292,11 @@ opti55x_reset(void *priv)
 
     /* DMA S/G */
     dma_set_params(1, 0xffffffff);
+
+    if (dev->dram) {
+        dev->regs[0x00] = dev->regs[0x13] = dev->regs[0x14] = dev->regs[0x19] = 0x00;
+        opti55x_dram_update(dev);
+    }
 }
 
 static void
@@ -1053,6 +1305,14 @@ opti55x_close(void *priv)
     opti55x_t *dev = (opti55x_t *) priv;
 
     smram_del(dev->smram);
+
+    if (dev->dram) {
+        mem_mapping_disable(&dev->low_mapping);
+        mem_mapping_disable(&dev->high_mapping);
+        if (dev->stuck_addr)
+            mem_mapping_disable(&dev->stuck_mapping);
+        free(dev->simm_data);
+    }
 
     if (flash_bios_write_gate_priv == dev) {
         flash_bios_write_gate      = NULL;
@@ -1077,6 +1337,36 @@ opti55x_init(const device_t *info)
     opti55x_t *dev = (opti55x_t *) calloc(1, sizeof(opti55x_t));
 
     dev->log = log_open("OPTi55x");
+
+    /* Device options first: the device_add() calls below change the current device */
+    uint32_t capacity = 0;
+    for (int pair = 0; pair < 2; pair++) {
+        int type = device_get_config_int(pair ? "pair1" : "pair0");
+        if ((type < 0) || (type >= (int) (sizeof(simm_types) / sizeof(simm_types[0]))))
+            fatal("OPTi 82C557M: bad SIMM type %d in pair %d\n", type, pair);
+        dev->simm[pair]        = simm_types[type];
+        dev->simm[pair].offset = capacity;
+        capacity += dev->simm[pair].sides << (dev->simm[pair].rows + dev->simm[pair].cols + 3);
+    }
+    dev->dram = capacity > 0;
+    if (dev->dram) {
+        dev->simm_data = calloc(1, capacity);
+        if (!dev->simm_data)
+            fatal("OPTi 82C557M: out of memory for %u MB of SIMMs\n", capacity >> 20);
+        mem_mapping_add(&dev->low_mapping, 0, 0xa0000, opti55x_ram_readb, opti55x_ram_readw, opti55x_ram_readl,
+                        opti55x_ram_writeb, opti55x_ram_writew, opti55x_ram_writel, NULL, 0, dev);
+        mem_mapping_add(&dev->high_mapping, 0x100000, 0x0ff00000, opti55x_ram_readb, opti55x_ram_readw,
+                        opti55x_ram_readl, opti55x_ram_writeb, opti55x_ram_writew, opti55x_ram_writel, NULL, 0, dev);
+        mem_mapping_disable(&dev->low_mapping);
+        mem_mapping_disable(&dev->high_mapping);
+        dev->stuck_addr = device_get_config_int("stuck_addr");
+        dev->stuck_mask = 1 << device_get_config_int("stuck_bit");
+        if (dev->stuck_addr) /* added last: in front of the RAM and the mappings above */
+            mem_mapping_add(&dev->stuck_mapping, dev->stuck_addr & ~0xfff, 0x1000, opti55x_stuck_readb,
+                            opti55x_stuck_readw, opti55x_stuck_readl, opti55x_ram_writeb, opti55x_ram_writew,
+                            opti55x_ram_writel, NULL, 0, dev);
+        dev->flat = -1; /* no layout yet: the reset sets one up */
+    }
 
     dev->has_ide = (info->local & 0x01);
 
@@ -1123,6 +1413,46 @@ opti55x_init(const device_t *info)
     return dev;
 }
 
+#define OPTI55X_PAIR(n, sockets)                                                       \
+    {                                                                                   \
+        .name = "pair" #n, .description = "SIMM pair " sockets, .type = CONFIG_SELECTION,  \
+        .default_int = 0, .selection = {                                                \
+            { .description = "Empty", .value = 0 },                                     \
+            { .description = "2 x 1 MB, 256Kx32, row/column bits 9/9", .value = 1 },    \
+            { .description = "2 x 2 MB, 256Kx32, 9/9, double sided", .value = 2 },      \
+            { .description = "2 x 2 MB, 512Kx32, 10/9", .value = 3 },                   \
+            { .description = "2 x 4 MB, 1Mx32, 10/10", .value = 4 },                    \
+            { .description = "2 x 8 MB, 1Mx32, 10/10, double sided", .value = 5 },      \
+            { .description = "2 x 8 MB, 2Mx32, 11/10", .value = 6 },                    \
+            { .description = "2 x 16 MB, 4Mx32, 11/11", .value = 7 },                   \
+            { .description = "2 x 16 MB, 2Mx32, 11/10, double sided", .value = 8 },     \
+            { .description = "2 x 32 MB, 4Mx32, 11/11, double sided", .value = 9 },     \
+            { .description = "2 x 32 MB, 8Mx32, 12/11", .value = 10 },                  \
+            { .description = "" } }                                                     \
+    }
+
+/* Both pairs empty: no DRAM model, flat RAM of the machine size. */
+static const device_config_t opti55x_config[] = {
+    OPTI55X_PAIR(0, "J23/J24 (RAS0#/RAS1#)"), OPTI55X_PAIR(1, "J27/J28 (RAS2#/RAS3#)"),
+    {
+        .name = "stuck_addr", .description = "Faulty RAM byte (any address in the .cfg)", .type = CONFIG_SELECTION,
+        .default_int = 0, .selection = {
+            { .description = "None", .value = 0 },
+            { .description = "2AA400h", .value = 0x2aa400 },
+            { .description = "" } }
+    },
+    {
+        .name = "stuck_bit", .description = "Faulty RAM bit (reads 0)", .type = CONFIG_SELECTION,
+        .default_int = 3, .selection = {
+            { .description = "0", .value = 0 }, { .description = "1", .value = 1 },
+            { .description = "2", .value = 2 }, { .description = "3", .value = 3 },
+            { .description = "4", .value = 4 }, { .description = "5", .value = 5 },
+            { .description = "6", .value = 6 }, { .description = "7", .value = 7 },
+            { .description = "" } }
+    },
+    { .name = "", .description = "", .type = CONFIG_END }
+};
+
 const device_t opti55x_device = {
     .name          = "OPTi 82C55x (Viper)",
     .internal_name = "opti55x",
@@ -1134,7 +1464,7 @@ const device_t opti55x_device = {
     .available     = NULL,
     .speed_changed = NULL,
     .force_redraw  = NULL,
-    .config        = NULL
+    .config        = opti55x_config
 };
 
 const device_t opti55x_noide_device = {
