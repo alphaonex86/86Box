@@ -5,9 +5,11 @@
  * device: no transaction translator). Schedules are walked from RAM by bus mastering every ms, as the hardware does
  * (nothing runs while PCI bus mastering is off). Port 0: a low-speed HID boot keyboard (BOX86_USB_KBD=1; keys typed
  * by the test control's "usbkey"; its TDs need the LS bit, else they time out); port 1: a bulk-only mass storage
- * disk on an image file (BOX86_USB_DISK=path), high speed on EHCI, full speed on UHCI. BOX86_USB_FAULT injects one
- * fault: kbd-stall (the keyboard stalls its control requests), disk-nak (the disk never sends data), disk-stall (it
- * stalls the data of READ), disk-csw (bad CSW signature), disk-gone (it is unplugged 3 s after its first READ).
+ * disk on an image file (BOX86_USB_DISK=path), high speed on EHCI, full speed on UHCI (BOX86_USB_DISK_FS=1: full
+ * speed only, as on a port that does not chirp: EHCI leaves it disabled after the reset, software hands it to UHCI).
+ * BOX86_USB_FAULT injects one fault: kbd-stall (the keyboard stalls its control requests), disk-nak (the disk never
+ * sends data), disk-stall (it stalls the data of READ), disk-csw (bad CSW signature), disk-gone (it is unplugged 3 s
+ * after its first READ).
  * Enough of USB for a BIOS and an OS driver: control, interrupt and bulk transfers, SCSI INQUIRY, TEST UNIT READY,
  * REQUEST SENSE, READ CAPACITY, READ/WRITE(10), MODE SENSE.
  */
@@ -33,7 +35,7 @@ static uint64_t Frames;
 
 typedef struct usbdev_t usbdev_t;
 struct usbdev_t {
-    int present, low_speed, high_speed, addr, new_addr, config;   /* high_speed: running at 480 Mbit/s (EHCI) */
+    int present, low_speed, full_speed_only, high_speed, addr, new_addr, config; /* high_speed: 480 Mbit/s (EHCI) */
     const uint8_t *dev_desc, *cfg_desc, *hs_cfg_desc;             /* hs_cfg_desc: at high speed, if it can */
     int cfg_len;
     int (*class_request)(usbdev_t *d, const uint8_t *setup, uint8_t *data);   /* data length, or R_STALL */
@@ -957,7 +959,7 @@ ehci_port_write(card_t *c, int p, uint32_t val)
         d->addr = d->config = d->high_speed = 0;
     } else if (!(val & EP_PR) && (*sc & EP_PR)) {      /* reset done: a high-speed device is enabled */
         *sc &= ~EP_PR;
-        if (d->present && ehci_owns(c, p) && !d->low_speed) {
+        if (d->present && ehci_owns(c, p) && !d->low_speed && !d->full_speed_only) {
             *sc |= EP_PE;
             d->high_speed = 1;
         }
@@ -1166,7 +1168,8 @@ card_init(const device_t *info)
         usbdev_t *m = &Dev[1];
         fseek(Msc.img, 0, SEEK_END);
         Msc.blocks = ftell(Msc.img) / 512;
-        m->present = 1, m->dev_desc = msc_dev_desc, m->cfg_desc = msc_cfg_desc, m->hs_cfg_desc = msc_hs_cfg_desc;
+        m->present = 1, m->full_speed_only = getenv("BOX86_USB_DISK_FS") != NULL;
+        m->dev_desc = msc_dev_desc, m->cfg_desc = msc_cfg_desc, m->hs_cfg_desc = msc_hs_cfg_desc;
         m->cfg_len = sizeof(msc_cfg_desc), m->class_request = msc_class, m->in = msc_in, m->out = msc_out;
     }
     mem_mapping_add(&c->ehci.mmio, 0, 0, ehci_readb, ehci_readw, ehci_readl, ehci_writeb, ehci_writew, ehci_writel,
