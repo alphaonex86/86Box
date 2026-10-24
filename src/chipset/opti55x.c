@@ -190,11 +190,19 @@ opti55x_smram_recalc(void *priv)
    SIMM cells as the 82C557M programs them (Viper-M data book), so a BIOS sizing the banks sees the aliases
    and holes of real hardware. The 64-bit banks RAS0#-RAS5# follow each other from 0, code n = 2 MB << (n - 1):
    full decode (13h bit 7) 13h, 14h and 19h (bank 4 with bit 3, bank 5 with bit 7), else table 5-36 by 00h.
-   A SIMM pair holds banks 2p (side A) and 2p + 1 (side B); banks 4 and 5 have no sockets. Table 4-16: column
+   Socket pair J23/J24 holds banks 0 (side A) and 1 (side B), J27/J28 banks 4 and 5 (RAS4#/RAS5#, IBM's SIMM pinout
+   and BIOS); banks 2 and 3 have no sockets (the SIMM3/SIMM4 footprints). Table 4-16: column
    MA0-8 = A3-A11, row MA0-8 = A12-A20, then row MA9-11 = A21/A23/A25 and column A22/A24/A26 as far as the
    bank code needs; MA11 is RAS4# with 19h bit 3. While that decode is one-to-one the data is in flat 86Box
    RAM, else in simm_data behind the opti55x_ram_* handlers (0-640K and 1M-256M).
 */
+/* The socket pair of a bank, -1: none */
+static int
+opti55x_bank_pair(int bank)
+{
+    return (bank < 2) ? 0 : (bank >= 4) ? 1 : -1;
+}
+
 static void
 opti55x_bank_codes(const uint8_t *regs, uint8_t *code)
 {
@@ -226,10 +234,11 @@ opti55x_dram_decode(const opti55x_t *dev, const uint8_t *regs, uint32_t addr)
             break;
         base += size;
     }
-    if ((bank >= 4) || ((bank & 1) >= dev->simm[bank >> 1].sides))
+    int pair = (bank < 6) ? opti55x_bank_pair(bank) : -1;
+    if ((pair < 0) || ((bank & 1) >= dev->simm[pair].sides))
         return -1;
 
-    const opti55x_simm_t *simm = &dev->simm[bank >> 1];
+    const opti55x_simm_t *simm = &dev->simm[pair];
     int                   n    = code[bank];
     uint32_t              row  = (addr >> 12) & 0x1ff;
     uint32_t              col  = (addr >> 3) & 0x1ff;
@@ -259,8 +268,9 @@ opti55x_dram_flat(const opti55x_t *dev, const uint8_t *regs, uint32_t *top)
         if (!n)
             continue;
         *top += 1u << (20 + n);
-        if ((bank >= 4) || ((bank & 1) >= dev->simm[bank >> 1].sides) || ((regs[3] & 0x08) && (n >= 6)) ||
-            (9 + n / 2 > dev->simm[bank >> 1].rows) || (9 + (n - 1) / 2 > dev->simm[bank >> 1].cols))
+        int pair = opti55x_bank_pair(bank);
+        if ((pair < 0) || ((bank & 1) >= dev->simm[pair].sides) || ((regs[3] & 0x08) && (n >= 6)) ||
+            (9 + n / 2 > dev->simm[pair].rows) || (9 + (n - 1) / 2 > dev->simm[pair].cols))
             flat = 0;
     }
     return flat && (*top >= 0x100000) && (*top <= mem_size * 1024);
@@ -1507,7 +1517,7 @@ opti55x_init(const device_t *info)
 
 /* Both pairs empty: no DRAM model, flat RAM of the machine size. */
 static const device_config_t opti55x_config[] = {
-    OPTI55X_PAIR(0, "J23/J24 (RAS0#/RAS1#)"), OPTI55X_PAIR(1, "J27/J28 (RAS2#/RAS3#)"),
+    OPTI55X_PAIR(0, "J23/J24 (RAS0#/RAS1#)"), OPTI55X_PAIR(1, "J27/J28 (RAS4#/RAS5#)"),
     {
         .name = "stuck_addr", .description = "Faulty RAM byte (any address in the .cfg)", .type = CONFIG_SELECTION,
         .default_int = 0, .selection = {
